@@ -3,7 +3,7 @@ import path from "node:path";
 export const API_VERSION = "web2api.v1";
 export const OUTPUT_FORMATS = new Set(["text", "markdown", "latex"]);
 export const ARTIFACT_POLICIES = new Set(["none", "collect"]);
-export const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "needs_login"]);
+export const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "needs_login", "cancelled"]);
 
 export class ApiError extends Error {
   constructor(code, message, { status = 400, details = null, cause } = {}) {
@@ -96,7 +96,11 @@ export function normalizeGenerationRequest(payload) {
   if (!isRecord(payload)) {
     throw new ApiError("invalid_request", "Request body must be a JSON object.");
   }
-  rejectUnknownFields(payload, ["provider", "input", "output", "artifactPolicy", "idempotencyKey", "timeoutMs", "model"]);
+  rejectUnknownFields(payload, ["provider", "input", "output", "artifactPolicy", "idempotencyKey", "timeoutMs", "model", "conversationId"]);
+  if ("conversationId" in payload && (typeof payload.conversationId !== "string" ||
+      !/^(?:new|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$/u.test(payload.conversationId))) {
+    throw new ApiError("invalid_request", "conversationId must be new or a returned conversation ID.");
+  }
 
   const provider = nonEmptyString(payload.provider, "provider", { maxLength: 128 });
   const artifactPolicy = payload.artifactPolicy ?? "collect";
@@ -116,6 +120,7 @@ export function normalizeGenerationRequest(payload) {
 
   return {
     provider,
+    ...("conversationId" in payload ? { conversationId: payload.conversationId } : {}),
     ...("model" in payload ? { model: nonEmptyString(payload.model, "model", { maxLength: 128 }) } : {}),
     input: normalizeInput(payload.input),
     output: normalizeOutput(payload.output),
@@ -127,6 +132,9 @@ export function normalizeGenerationRequest(payload) {
 
 export function assertProviderSupportsRequest(provider, request) {
   const capabilities = provider.capabilities;
+  if (request.conversationId && !capabilities.conversations?.native) {
+    throw new ApiError("unsupported_feature", `Provider ${provider.id} does not support native conversations.`, { status: 422 });
+  }
   if ("model" in request && capabilities.modelSelection !== true) {
     throw new ApiError("unsupported_feature", `Provider ${provider.id} does not support model selection.`, { status: 422 });
   }

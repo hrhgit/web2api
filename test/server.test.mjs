@@ -57,9 +57,9 @@ test("local HTTP API advertises providers and completes a mock job", async () =>
     assert.equal(conflict.status, 409);
     assert.equal((await conflict.json()).error.code, "idempotency_conflict");
     const unknown = await fetch(`${baseUrl}/v1/jobs`, {
-      method: "POST", headers, body: JSON.stringify({ ...request, conversationId: "unsupported" }),
+      method: "POST", headers, body: JSON.stringify({ ...request, conversationId: "new" }),
     });
-    assert.equal(unknown.status, 400);
+    assert.equal(unknown.status, 422);
     assert.equal((await unknown.json()).error.code, "unsupported_feature");
   } finally {
     await close(server);

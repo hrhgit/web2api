@@ -38,7 +38,7 @@ for (const field of ["system", "instructions", "developer", "tools", "tool_choic
 test("rejects unknown top-level and nested fields instead of dropping them", () => {
   const request = { provider: "mock-web", input: [{ type: "text", text: "hello" }] };
   for (const payload of [
-    { ...request, conversationId: "existing-chat" },
+    { ...request, messages: [] },
     { ...request, providerOptions: { size: "large" } },
     { ...request, output: { format: "text", mode: "extract" } },
     { ...request, input: [{ type: "text", text: "hello", role: "system" }] },
@@ -61,6 +61,10 @@ test("model selection is validated against the selected provider", () => {
 test("Gemini accepts its declared text extraction formats", () => {
   const provider = new GeminiWebProvider();
   assert.deepEqual(provider.capabilities.output.formats, ["text", "markdown", "latex"]);
+  assert.equal(provider.uploadMethod, "menu");
+  assert.equal(provider.attachmentSettleMs, 2_000);
+  assert.equal(new GeminiWebProvider({ uploadMethod: "native", attachmentSettleMs: 0 }).uploadMethod, "native");
+  assert.equal(new GeminiWebProvider({ uploadMethod: "native", attachmentSettleMs: 0 }).attachmentSettleMs, 0);
   for (const format of ["text", "markdown", "latex"]) {
     const request = normalizeGenerationRequest({ provider: provider.id, input: [{ type: "text", text: "hello" }], output: { format } });
     assert.doesNotThrow(() => assertProviderSupportsRequest(provider, request));

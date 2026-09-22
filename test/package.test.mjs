@@ -24,7 +24,7 @@ test("npm pack dry-run contains only the public runtime package", async () => {
   assert.equal(result.code, 0, result.stderr);
   const pack = JSON.parse(result.stdout);
   assert.equal(pack.length, 1);
-  assert.equal(pack[0].id, "@ruihuahe/web2api@0.1.0");
+  assert.equal(pack[0].id, "@ruihuahe/web2api@0.2.0");
 
   const files = new Set(pack[0].files.map((file) => file.path.replace(/^package\//u, "")));
   assert.equal(files.has("LICENSE"), true);

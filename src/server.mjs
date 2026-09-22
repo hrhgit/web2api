@@ -62,6 +62,16 @@ export function createApiServer({ gateway, token = process.env.WEB2API_TOKEN || 
         return;
       }
       authorize(request, token);
+      const checkMatch = /^\/v1\/providers\/([A-Za-z0-9-]+)\/check$/u.exec(url.pathname);
+      if (request.method === "POST" && checkMatch) {
+        json(response, 200, await gateway.checkProvider(checkMatch[1]));
+        return;
+      }
+      const cancelMatch = /^\/v1\/jobs\/([A-Za-z0-9-]+)\/cancel$/u.exec(url.pathname);
+      if (request.method === "POST" && cancelMatch) {
+        json(response, 200, await gateway.cancelJob(cancelMatch[1]));
+        return;
+      }
       if (request.method === "GET" && (url.pathname === "/v1/providers" || url.pathname === "/v1/capabilities")) {
         json(response, 200, { object: "list", data: gateway.listProviders() });
         return;

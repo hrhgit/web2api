@@ -1,9 +1,11 @@
-import { stat } from "node:fs/promises";
 import os from "node:os";
+import { assertConversationPage, conversationAddress, waitForConversationIdle } from "./conversation.mjs";
 import path from "node:path";
-import { launchBrowser } from "./browser-session.mjs";
+import { BrowserPagePool, launchBrowser } from "./browser-session.mjs";
 import { browserCapabilities, ProviderError } from "./provider.mjs";
 import { extractResponseText } from "./extract-response.mjs";
+import { attachGeminiFile, attachmentNames, inspectGeminiUploadPage } from "./local-files.mjs";
+import { createUploadDebugLogger, summarizeError } from "./diagnostics.mjs";
 
 const GEMINI_URL = "https://gemini.google.com/app";
 const PROMPT_SELECTOR = '[role="textbox"][contenteditable="true"]';
@@ -104,19 +106,39 @@ async function getModelState(page, format) {
   return { ...state, ...await content.evaluate(extractResponseText, { format }) };
 }
 
-async function waitForModelResponse(page, baseline, { timeoutMs, signal, format }) {
+async function waitForModelResponse(page, baseline, { timeoutMs, signal, format, log = null }) {
   const deadline = Date.now() + timeoutMs;
   let lastText = "";
   let stableSince = 0;
+  let responseLogged = false;
   while (Date.now() < deadline) {
     if (signal?.aborted) throw signal.reason || new Error("Job aborted.");
     const state = await getModelState(page, format);
-    if (state.visibleError) throw new ProviderError("provider_ui_error", `Gemini displayed an error: ${state.visibleError}`);
+    if (state.visibleError) {
+      log?.("gemini_response_ui_error", { error: state.visibleError, responseCount: state.count });
+      throw new ProviderError("provider_ui_error", `Gemini displayed an error: ${state.visibleError}`);
+    }
     const isNewResponse = state.count > baseline.count || (state.text && state.text !== baseline.text);
     if (isNewResponse && state.text) {
+      if (!responseLogged) {
+        responseLogged = true;
+        log?.("gemini_response_detected", {
+          responseCount: state.count,
+          busy: state.busy,
+          textCharacters: state.text.length,
+          extraction: state.extraction,
+        });
+      }
       if (state.text === lastText && !state.busy) {
         if (!stableSince) stableSince = Date.now();
-        if (Date.now() - stableSince >= 2_500) return state;
+        if (Date.now() - stableSince >= 2_500) {
+          log?.("gemini_response_stable", {
+            responseCount: state.count,
+            textCharacters: state.text.length,
+            extraction: state.extraction,
+          });
+          return state;
+        }
       } else {
         lastText = state.text;
         stableSince = state.busy ? 0 : Date.now();
@@ -127,45 +149,20 @@ async function waitForModelResponse(page, baseline, { timeoutMs, signal, format 
   throw new ProviderError("response_timeout", `Gemini did not finish within ${Math.round(timeoutMs / 1000)} seconds.`);
 }
 
-async function waitForAttachment(page, filePath) {
-  const fileName = path.basename(filePath);
-  await page.waitForFunction(
-    (name) => (document.body?.innerText || "").includes(name),
-    fileName,
-    { timeout: 60_000, polling: 500 },
-  );
-}
-
-async function attachLocalFile(page, filePath) {
-  let fileStats;
-  try {
-    fileStats = await stat(filePath);
-  } catch (error) {
-    throw new ProviderError("attachment_missing", `Attachment does not exist: ${filePath}`, { cause: error });
-  }
-  if (!fileStats.isFile()) {
-    throw new ProviderError("attachment_invalid", `Attachment is not a regular file: ${filePath}`);
-  }
-  const uploadTools = page.getByRole("button", { name: "Upload & tools", exact: true });
-  await uploadTools.click({ timeout: 30_000 });
-  const upload = page.locator('button[aria-label="Upload files. Documents, data, code files"]');
-  const [chooser] = await Promise.all([
-    page.waitForEvent("filechooser", { timeout: 15_000 }),
-    upload.click({ timeout: 15_000 }),
-  ]);
-  await chooser.setFiles(filePath);
-  await waitForAttachment(page, filePath);
-}
-
 export class GeminiWebProvider {
   constructor(options = {}) {
     this.id = "gemini-web";
     this.displayName = "Gemini Web";
     this.capabilities = browserCapabilities({
       localFiles: true,
+      nativeConversations: true,
       outputFormats: ["text", "markdown", "latex"],
       login: "persistent_local_profile",
       artifacts: { downloadableFiles: false, generatedImages: false },
+      readinessCheck: true,
+      runningCancellation: true,
+      submissionTracking: true,
+      maxConcurrency: Number(options.maxConcurrency ?? process.env.WEB2API_GEMINI_CONCURRENCY ?? 3),
     });
     this.settings = {
       profileDirectory: path.resolve(options.profileDirectory || process.env.WEB2API_GEMINI_PROFILE_DIR || defaultProfileDirectory()),
@@ -173,6 +170,19 @@ export class GeminiWebProvider {
       channel: options.channel || process.env.WEB2API_BROWSER_CHANNEL || "chrome",
       executablePath: options.executablePath || process.env.WEB2API_BROWSER_EXECUTABLE || null,
     };
+    const attachmentSettleMs = Number(options.attachmentSettleMs ?? process.env.WEB2API_GEMINI_ATTACHMENT_SETTLE_MS ?? 2_000);
+    this.attachmentSettleMs = Number.isFinite(attachmentSettleMs) ? Math.max(0, Math.min(30_000, attachmentSettleMs)) : 0;
+    this.uploadMethod = options.uploadMethod ?? process.env.WEB2API_GEMINI_UPLOAD_METHOD ?? "menu";
+    this.pool = new BrowserPagePool(this.settings, { displayName: this.displayName });
+    this.uploadLog = options.log ?? createUploadDebugLogger();
+  }
+
+  async check({ timeoutMs = 30_000 } = {}) {
+    const { context, page } = await launchBrowser(this.settings, { displayName: this.displayName });
+    try {
+      await page.goto(GEMINI_URL, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+      await waitForGeminiReady(page, timeoutMs);
+    } finally { await context.close(); }
   }
 
   async login({ timeoutMs = 15 * 60_000 } = {}) {
@@ -180,24 +190,59 @@ export class GeminiWebProvider {
     try {
       await page.goto(GEMINI_URL, { waitUntil: "domcontentloaded" });
       await waitForLogin(page, timeoutMs);
-      return { provider: this.id, profileDirectory: this.settings.profileDirectory, profileName: this.settings.profileName };
+      return { provider: this.id, status: "ready" };
     } finally {
       await context.close().catch(() => {});
     }
   }
 
-  async generate(request, { signal } = {}) {
-    const { context, page } = await launchBrowser(this.settings, { displayName: this.displayName });
-    const closeOnAbort = () => { void context.close().catch(() => {}); };
+  async generate(request, { jobId = null, signal, conversationUrl = null, reportSubmission = async () => {} } = {}) {
+    signal?.throwIfAborted();
+    const { page, release } = await this.pool.acquire();
+    const log = (event, details = {}) => this.uploadLog?.(event, { provider: this.id, jobId, ...details });
+    const uploadLog = this.uploadLog ? log : null;
+    const closeOnAbort = () => { void page.close().catch(() => {}); };
     signal?.addEventListener("abort", closeOnAbort, { once: true });
     try {
       if (signal?.aborted) throw signal.reason || new Error("Job aborted.");
-      await page.goto(GEMINI_URL, { waitUntil: "domcontentloaded" });
+      log("gemini_generation_started", {
+        input: request.input.map((item) => item.type === "text"
+          ? { type: "text", characters: item.text.length }
+          : { type: "local_file", fileName: path.basename(item.path) }),
+        outputFormat: request.output.format,
+        timeoutMs: request.timeoutMs,
+      });
+      await page.goto(conversationUrl ? conversationAddress(conversationUrl, this.id) : GEMINI_URL, { waitUntil: "domcontentloaded", timeout: Math.min(request.timeoutMs, 60_000) });
       await waitForGeminiReady(page, Math.min(request.timeoutMs, 60_000));
+      if (conversationUrl) await waitForConversationIdle(page, {
+        address: conversationUrl, provider: this.id, state: () => getModelState(page, request.output.format),
+        userSelector: USER_QUERY_SELECTOR, timeoutMs: Math.min(request.timeoutMs, 60_000), signal,
+      });
+      log("gemini_page_ready", { url: page.url(), title: await page.title().catch(() => null) });
       const format = request.output.format;
       const baseline = await getModelState(page, format);
+      if (request.conversationId && !conversationUrl && (baseline.count || await page.locator(USER_QUERY_SELECTOR).count())) {
+        throw new ProviderError("conversation_unavailable", "A fresh conversation could not be established. No prompt was sent.");
+      }
+      log("gemini_before_upload", {
+        url: page.url(),
+        responseCount: baseline.count,
+        composerReady: Boolean(await page.locator(PROMPT_SELECTOR).count()),
+      });
       for (const item of request.input) {
-        if (item.type === "local_file") await attachLocalFile(page, item.path);
+        if (item.type === "local_file") {
+          await attachGeminiFile(page, item.path, { log: uploadLog, uploadMethod: this.uploadMethod });
+        }
+      }
+      if (uploadLog) {
+        log("gemini_after_upload", {
+          ...(await inspectGeminiUploadPage(page, request.input.filter((item) => item.type === "local_file").map((item) => item.path))),
+        });
+      }
+      if (this.attachmentSettleMs > 0 && request.input.some((item) => item.type === "local_file")) {
+        log("gemini_attachment_settle_started", { milliseconds: this.attachmentSettleMs });
+        await page.waitForTimeout(this.attachmentSettleMs);
+        log("gemini_attachment_settle_finished", { milliseconds: this.attachmentSettleMs });
       }
       const prompt = composePrompt(request);
       const previousMessages = await submittedMessages(page);
@@ -207,32 +252,57 @@ export class GeminiWebProvider {
         throw new ProviderError("composer_mismatch", "Gemini's composer did not retain the submitted prompt.");
       }
       const send = page.getByRole("button", { name: /^(send|send message|submit|发送|发送消息)$/iu });
+      signal?.throwIfAborted();
+      log("gemini_before_submit", { url: page.url(), userMessageCount: previousMessages.length });
+      if (conversationUrl) {
+        assertConversationPage(page, conversationUrl, this.id);
+        const state = await getModelState(page, format);
+        if (state.busy || state.count !== baseline.count || state.text !== baseline.text || (await submittedMessages(page)).length !== previousMessages.length) {
+          throw new ProviderError("conversation_busy", "Conversation changed before submission. No follow-up was sent.");
+        }
+      }
+      await reportSubmission("unknown");
       await send.click({ timeout: 120_000 });
+      log("gemini_send_clicked", { url: page.url() });
       await page.waitForFunction(
-        ({ selector, previousCount, expected }) => {
+        ({ selector, previousCount, expected, attachments }) => {
           const nodes = [...document.querySelectorAll(selector)];
           if (nodes.length <= previousCount) return false;
           const node = nodes.at(-1);
           const lines = [...node.querySelectorAll(".query-text-line")];
           const text = (lines.length ? lines.map((line) => line.textContent).join("\n") : node.textContent || "")
             .replace(/\s+/gu, " ").trim();
-          return text === expected;
+          const submittedFiles = [...node.querySelectorAll('[data-test-id="uploaded-file"], user-query-file-preview')]
+            .map((file) => `${file.getAttribute("aria-label") || ""} ${file.textContent || ""}`);
+          return text === expected && attachments.every((names) => submittedFiles.some((label) => names.some((name) => label.includes(name))));
         },
-        { selector: USER_QUERY_SELECTOR, previousCount: previousMessages.length, expected: normalizeText(prompt) },
+        { selector: USER_QUERY_SELECTOR, previousCount: previousMessages.length, expected: normalizeText(prompt),
+          attachments: request.input.filter((item) => item.type === "local_file").map((item) => attachmentNames(item.path)) },
         { timeout: 30_000, polling: 250 },
       ).catch((error) => {
         throw new ProviderError("submission_unconfirmed", "Gemini did not confirm the submitted prompt; web2api will not send a duplicate request.", { cause: error });
       });
-      const response = await waitForModelResponse(page, baseline, { timeoutMs: request.timeoutMs, signal, format });
+      await reportSubmission("confirmed");
+      log("gemini_submission_confirmed", {
+        url: page.url(),
+        userMessageCount: await page.locator(USER_QUERY_SELECTOR).count(),
+        attachmentNames: request.input.filter((item) => item.type === "local_file").map((item) => attachmentNames(item.path)),
+      });
+      const response = await waitForModelResponse(page, baseline, { timeoutMs: request.timeoutMs, signal, format, log });
+      if (conversationUrl) assertConversationPage(page, conversationUrl, this.id);
+      if (request.conversationId) conversationAddress(page.url(), this.id);
       return {
         text: response.text,
         outputEnforcement: "dom_extraction",
         artifacts: [],
         providerMetadata: { conversationUrl: page.url(), extraction: response.extraction },
       };
+    } catch (error) {
+      log("gemini_generation_failed", { url: page.url(), error: summarizeError(error) });
+      throw error;
     } finally {
       signal?.removeEventListener("abort", closeOnAbort);
-      await context.close().catch(() => {});
+      await release();
     }
   }
 }

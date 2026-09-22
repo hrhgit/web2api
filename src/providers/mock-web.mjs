@@ -9,8 +9,10 @@ export class MockWebProvider {
   constructor() {
     this.id = "mock-web";
     this.displayName = "Mock Web";
-    this.capabilities = browserCapabilities({ outputFormats: ["text", "markdown", "latex"] });
+    this.capabilities = browserCapabilities({ outputFormats: ["text", "markdown", "latex"], readinessCheck: true, runningCancellation: true });
   }
+
+  async check() {}
 
   async generate(request) {
     const text = request.input

@@ -121,3 +121,23 @@ test("browser profile lock errors do not disclose the local profile path", async
   await assert.rejects(provider.generate({ input: [{ type: "text", text: "hello" }], output: { format: "text" }, timeoutMs: 3000 }),
     (error) => error.code === "profile_busy" && !error.message.includes(provider.settings.profileDirectory));
 });
+
+test("readiness checks the composer without submitting a model prompt", async (t) => {
+  const fixture = await fixtureProvider(t, () => `<!doctype html><body>${account}${editor}`);
+  await fixture.provider.check({ timeoutMs: 3000 });
+  assert.equal(fixture.submittedPrompt, null);
+  assert.equal(fixture.context.pages().length, 0);
+});
+
+test("cancelling one Gemini job leaves the concurrent job's page and response intact", async (t) => {
+  const fixture = await fixtureProvider(t, () => responsePage("Independent result"));
+  const controller = new AbortController();
+  const request = { input: [{ type: "text", text: "first" }], output: { format: "text" }, timeoutMs: 10000 };
+  const first = fixture.provider.generate(request, { signal: controller.signal }).then(() => "completed", () => "cancelled");
+  const second = fixture.provider.generate({ ...request, input: [{ type: "text", text: "second" }] });
+  await fixture.page.locator("user-query").waitFor();
+  controller.abort(new Error("cancel first"));
+  assert.equal(await first, "cancelled");
+  assert.equal((await second).text, "Independent result");
+  assert.equal(fixture.context.pages().length, 0);
+});

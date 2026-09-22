@@ -1,4 +1,5 @@
 import os from "node:os";
+import { assertConversationPage, conversationAddress, waitForConversationIdle } from "./conversation.mjs";
 import path from "node:path";
 import { assertProviderSupportsRequest } from "../core/contracts.mjs";
 import { launchBrowser } from "./browser-session.mjs";
@@ -137,7 +138,11 @@ export class OpenAIWebProvider {
     this.displayName = "ChatGPT Web";
     this.capabilities = browserCapabilities({
       outputFormats: ["text", "markdown", "latex"],
+      nativeConversations: true,
       login: "persistent_local_profile",
+      readinessCheck: true,
+      runningCancellation: true,
+      submissionTracking: true,
     });
     this.settings = {
       profileDirectory: path.resolve(options.profileDirectory || process.env.WEB2API_OPENAI_PROFILE_DIR || path.join(os.homedir(), ".web2api", "profiles", "openai")),
@@ -162,7 +167,16 @@ export class OpenAIWebProvider {
     }
   }
 
-  async generate(request, { signal } = {}) {
+  async check({ timeoutMs = 30_000 } = {}) {
+    const { context, page } = await launchBrowser(this.settings, { background: this.background, displayName: this.displayName });
+    try {
+      await page.goto(CHATGPT_URL, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+      await waitForReady(page, timeoutMs);
+      await ensureChatMode(page, timeoutMs);
+    } finally { await context.close(); }
+  }
+
+  async generate(request, { signal, conversationUrl = null, reportSubmission = async () => {} } = {}) {
     assertProviderSupportsRequest(this, request);
     signal?.throwIfAborted();
     const { context, page } = await launchBrowser(this.settings, {
@@ -173,11 +187,18 @@ export class OpenAIWebProvider {
     signal?.addEventListener("abort", closeOnAbort, { once: true });
     try {
       signal?.throwIfAborted();
-      await page.goto(CHATGPT_URL, { waitUntil: "domcontentloaded" });
+      await page.goto(conversationUrl ? conversationAddress(conversationUrl, this.id) : CHATGPT_URL, { waitUntil: "domcontentloaded", timeout: Math.min(request.timeoutMs, 60_000) });
       await waitForReady(page, Math.min(request.timeoutMs, 60_000));
       await ensureChatMode(page, Math.min(request.timeoutMs, 30_000));
+      if (conversationUrl) await waitForConversationIdle(page, {
+        address: conversationUrl, provider: this.id, state: () => responseState(page, request.output.format),
+        userSelector: SELECTORS.user, timeoutMs: Math.min(request.timeoutMs, 60_000), signal,
+      });
       const previousUsers = await page.locator(SELECTORS.user).count();
       const previousResponses = await page.locator(SELECTORS.assistant).count();
+      if (request.conversationId && !conversationUrl && (previousUsers || previousResponses)) {
+        throw new ProviderError("conversation_unavailable", "A fresh conversation could not be established. No prompt was sent.");
+      }
       const prompt = request.input.filter((item) => item.type === "text").map((item) => item.text).join("\n\n");
       const editor = page.locator(SELECTORS.prompt);
       await editor.fill(prompt);
@@ -193,6 +214,15 @@ export class OpenAIWebProvider {
       if (!(await page.evaluate(chatModeSelected, SELECTORS))) {
         throw new ProviderError("chat_mode_changed", "ChatGPT left Chat mode before submission. No prompt was submitted.");
       }
+      signal?.throwIfAborted();
+      if (conversationUrl) {
+        assertConversationPage(page, conversationUrl, this.id);
+        const state = await responseState(page, request.output.format);
+        if (state.busy || !state.complete || state.count !== previousResponses || await page.locator(SELECTORS.user).count() !== previousUsers) {
+          throw new ProviderError("conversation_busy", "Conversation changed before submission. No follow-up was sent.");
+        }
+      }
+      await reportSubmission("unknown");
       await page.locator(SELECTORS.send).click({ timeout: Math.min(request.timeoutMs, 30_000) });
       const submitted = await page.waitForFunction(({ selector, previousCount, expected }) => {
         const nodes = [...document.querySelectorAll(selector)];
@@ -202,7 +232,10 @@ export class OpenAIWebProvider {
         throw new ProviderError("submission_unconfirmed", "ChatGPT did not confirm the submitted prompt; web2api will not send a duplicate request.", { cause: error });
       });
       await submitted.dispose();
+      await reportSubmission("confirmed");
       const response = await waitForResponse(page, previousResponses, { timeoutMs: request.timeoutMs, signal, format: request.output.format });
+      if (conversationUrl) assertConversationPage(page, conversationUrl, this.id);
+      if (request.conversationId) conversationAddress(page.url(), this.id);
       return {
         text: response.text,
         outputEnforcement: "dom_extraction",

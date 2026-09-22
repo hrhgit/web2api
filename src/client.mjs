@@ -1,5 +1,5 @@
 const DEFAULT_BASE_URL = "http://127.0.0.1:8787";
-const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "needs_login"]);
+const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "needs_login", "cancelled"]);
 
 function normalizeBaseUrl(value) {
   if (typeof value !== "string" || !value.trim()) {
@@ -86,7 +86,7 @@ export class Web2ApiClient {
 
     let response;
     try {
-      response = await this.#fetch(`${this.#baseUrl}${path}`, { ...init, headers });
+      response = await this.#fetch(`${this.#baseUrl}${path}`, { signal: AbortSignal.timeout(90_000), ...init, headers });
     } catch (error) {
       throw new Web2ApiClientError("Could not reach the web2api service.", {
         code: "network_error",
@@ -153,6 +153,14 @@ export class Web2ApiClient {
     return this.#json(`/v1/jobs/${requireIdentifier(jobId, "jobId")}`);
   }
 
+  async checkProvider(providerId) {
+    return this.#json(`/v1/providers/${requireIdentifier(providerId, "providerId")}/check`, { method: "POST" });
+  }
+
+  async cancel(jobId) {
+    return this.#json(`/v1/jobs/${requireIdentifier(jobId, "jobId")}/cancel`, { method: "POST" });
+  }
+
   async waitForTerminal(jobId, { timeoutMs = 5 * 60_000, intervalMs = 250, signal } = {}) {
     if (!Number.isInteger(timeoutMs) || timeoutMs < 0) {
       throw new TypeError("timeoutMs must be a non-negative integer.");
@@ -162,6 +170,7 @@ export class Web2ApiClient {
     }
     const deadline = Date.now() + timeoutMs;
     while (true) {
+      signal?.throwIfAborted();
       const job = await this.getJob(jobId);
       if (TERMINAL_JOB_STATUSES.has(job.status)) return job;
       const remaining = deadline - Date.now();

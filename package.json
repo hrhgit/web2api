@@ -1,6 +1,6 @@
 {
   "name": "@ruihuahe/web2api",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "A capability-declared local gateway for browser-backed AI web applications.",
   "license": "MIT",
@@ -25,7 +25,7 @@
     "start": "node ./src/cli.mjs",
     "test": "node --test test/*.test.mjs",
     "test:browser": "node --test test/browser/*.test.mjs",
-    "check": "node --check ./src/cli.mjs && node --check ./src/app.mjs && node --check ./src/server.mjs && node --check ./src/client.mjs && node --check ./src/core/contracts.mjs && node --check ./src/core/gateway.mjs && node --check ./src/core/job-store.mjs && node --check ./src/core/artifacts.mjs && node --check ./src/providers/provider.mjs && node --check ./src/providers/browser-session.mjs && node --check ./src/providers/mock-web.mjs && node --check ./src/providers/gemini-web.mjs && node --check ./src/providers/openai-web.mjs && node --check ./src/providers/extract-response.mjs",
+    "check": "node --check ./src/cli.mjs && node --check ./src/app.mjs && node --check ./src/server.mjs && node --check ./src/client.mjs && node --check ./src/core/contracts.mjs && node --check ./src/core/gateway.mjs && node --check ./src/core/job-store.mjs && node --check ./src/core/artifacts.mjs && node --check ./src/providers/provider.mjs && node --check ./src/providers/browser-session.mjs && node --check ./src/providers/mock-web.mjs && node --check ./src/providers/gemini-web.mjs && node --check ./src/providers/openai-web.mjs && node --check ./src/providers/extract-response.mjs && node --check ./src/providers/local-files.mjs",
     "pack:check": "npm pack --dry-run --json --ignore-scripts",
     "prepublishOnly": "npm run check && npm test && npm run test:browser && npm run pack:check"
   },

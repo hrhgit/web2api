@@ -2,6 +2,8 @@
 
 ## Harness
 
+- Native multi-turn conversations must resume the same provider conversation and serialize turns within each conversation. Never send a follow-up while the preceding generation is active or its completion is uncertain.
+
 - Keep web2api a capability-declared adapter gateway: never claim full model-API compatibility for browser functionality that is unavailable or only emulated, including true system roles, native tool calls, model controls, token accounting, and token streaming.
 - Keep each browser provider isolated behind its own adapter and persistent local profile. The service must default to loopback-only access and must never expose browser profile paths, cookies, or credentials through its API.
 - Model generated files and images as first-class artifacts with origin metadata, media type, byte size, SHA-256, and a safely staged local copy; provider-specific UI extraction belongs in adapters, not response-text parsing.

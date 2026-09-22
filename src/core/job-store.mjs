@@ -7,6 +7,7 @@ function clone(value) {
 }
 
 export class FileJobStore {
+  #updates = new Map();
   constructor(dataDirectory) {
     this.dataDirectory = path.resolve(dataDirectory);
     this.jobsDirectory = path.join(this.dataDirectory, "jobs");
@@ -53,6 +54,14 @@ export class FileJobStore {
   }
 
   async update(id, update) {
+    const previous = this.#updates.get(id) || Promise.resolve();
+    const pending = previous.catch(() => {}).then(() => this.#update(id, update));
+    this.#updates.set(id, pending);
+    try { return await pending; }
+    finally { if (this.#updates.get(id) === pending) this.#updates.delete(id); }
+  }
+
+  async #update(id, update) {
     const current = await this.get(id);
     if (!current) throw new ApiError("job_not_found", `Job ${id} was not found.`, { status: 404 });
     const next = await update(clone(current));

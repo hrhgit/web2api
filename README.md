@@ -6,10 +6,11 @@ This is a same-machine service, not a public or remotely deployable model API. I
 
 The project separates a job/artifact contract from provider-specific browser automation. A caller can submit text and supported local attachments, inspect a job, and retrieve safely staged provider artifacts. Output formats are checked against the selected provider's capabilities.
 
-## What v0.1 includes
+## What v0.2 includes
 
 - Local-only HTTP job API (`127.0.0.1` by default)
-- Persistent jobs, concurrent-safe idempotency within one service process, explicit `needs_login` state, and per-provider FIFO execution
+- Persistent jobs, concurrent-safe idempotency within one service process, explicit `needs_login` state, and per-provider FIFO admission with declared concurrency
+- Optional provider readiness checks and capability-declared local job cancellation
 - First-class artifacts with media type, SHA-256, byte size, source provenance, and a contained local copy
 - Text, Markdown structure, and LaTeX formula-source extraction from provider response DOMs
 - A deterministic `mock-web` provider for integration tests and client development
@@ -50,6 +51,14 @@ npx web2api serve
 
 The server listens on `http://127.0.0.1:8787` by default. It intentionally does not bind a public interface. Set `WEB2API_TOKEN` to require a bearer token from other local processes.
 
+For temporary Gemini upload diagnostics, set `WEB2API_UPLOAD_DEBUG=1` when starting the service. It writes JSONL events to stderr, including the upload method, visible drop target bounds, upload controls, file-input state, attachment labels, submitted-message count, and response timing. It does not log prompt text, file contents, cookies, or browser profile paths:
+
+```bash
+WEB2API_UPLOAD_DEBUG=1 npm start -- serve 2> /tmp/web2api-upload.log
+```
+
+Gemini uses the `Upload & tools` menu for local attachments, then waits 2 seconds after the file is confirmed before sending the prompt so the web app can finish preparing it. Override the upload path with `WEB2API_GEMINI_UPLOAD_METHOD=auto|native|menu`, or override the wait with `WEB2API_GEMINI_ATTACHMENT_SETTLE_MS` (0–30000) when diagnosing timing-sensitive behavior; set either override only for comparison tests.
+
 The package exposes a small HTTP client at `@ruihuahe/web2api/client`:
 
 ```js
@@ -67,7 +76,7 @@ const completed = await client.waitForTerminal(submitted.id);
 console.log(completed.output.text);
 ```
 
-Run one service process per data directory. Admission and idempotency are serialized within that process; generation is queued separately per provider. Multi-process scheduling is not implemented.
+Run one service process per data directory. Admission and idempotency are serialized within that process; generation is queued separately per provider. Gemini defaults to three independent pages in one persistent browser, preserving FIFO start admission; jobs can finish out of order. Set `WEB2API_GEMINI_CONCURRENCY=1` for serial execution (allowed range 1–16). Other bundled providers remain serial. The advertised `capabilities.scheduling.maxConcurrency` reports the actual limit. Cancelling one Gemini job closes only its own page; the shared browser closes when its last job releases it. Multi-process scheduling is not implemented.
 
 ```bash
 curl http://127.0.0.1:8787/v1/providers
@@ -84,12 +93,54 @@ curl -X POST http://127.0.0.1:8787/v1/jobs \
 
 Poll `GET /v1/jobs/<job-id>`. A completed job contains `output.text` and any staged `artifacts`; an artifact can be downloaded from its `downloadUrl`.
 
+## Native multi-turn conversations
+
+Gemini and ChatGPT support `conversationId: "new"` to create a conversation. The returned job immediately includes its actual `conversationId`; pass that ID on subsequent jobs to append questions to the same provider conversation. Omit the field for the existing independent-job behavior. Check `capabilities.conversations.native` first; `mock-web` does not implement native conversations.
+
+```js
+const first = await client.submit({
+  provider: "gemini-web",
+  conversationId: "new",
+  input: [{ type: "text", text: "Remember that our project is named Atlas." }],
+});
+// Safe even while the first answer is still generating: this turn waits.
+const second = await client.submit({
+  provider: "gemini-web",
+  conversationId: first.conversationId,
+  input: [{ type: "text", text: "What is our project named?" }],
+});
+const answer = await client.waitForTerminal(second.id);
+console.log(answer.output.text);
+```
+
+Each conversation executes turns in admission order, one at a time. Waiting turns stay `queued`, consume no provider concurrency slot, and their execution timeout has not started. Different conversations can use the provider's declared concurrency. Provider FIFO applies to eligible turns; a turn becomes eligible when its predecessor releases execution. Each job exposes `conversationId`, `turn`, and `previousJobId`. Jobs and the provider conversation URL persist, so completed conversations can resume after a service restart. The browser reopens that saved address and verifies loaded, idle history before sending only the new question; earlier prompts are not replayed or concatenated. ChatGPT's Chat-mode checks also apply to follow-ups.
+
+If a preceding turn was sent (or may have been sent) but did not complete successfully, subsequent turns fail with `conversation_blocked` without sending. This includes running cancellation, uncertain failures, and interrupted generation on restart. Start a new conversation in this case; automatic recovery of uncertain upstream turns is not implemented. Queued cancellation and failures known to occur before submission can be skipped safely. A missing, redirected, or unresumable provider conversation fails explicitly, and an active or unverifiably completed response produces `conversation_busy`. No Stop/Regenerate control is clicked to make room for a follow-up. The dedicated browser profile should not be used to manually send messages concurrently with the service.
+
+Conversation IDs belong to one provider and this service data directory. Unknown IDs return 404; using another provider returns 409. `idempotencyKey` remains request deduplication, not a conversation ID; use a different key for each new turn. The provider controls context limits and retention. This feature supplies native website conversation continuity, not system roles, role-labelled history input, or official model-API semantics.
+
+Validation on 2026-09-22: a real Gemini conversation completed two queued turns at the same provider address; the second turn recalled a random marker supplied only in the first. Local browser fixtures validate three-turn continuity, busy-response protection, and missing-conversation rejection for both providers. Live ChatGPT verification was blocked before submission by background-window minimization and browser verification; real-account ChatGPT multi-turn continuity remains unverified in this environment.
+
 ## Job outcomes and retries
 
 - Concurrent submissions with the same provider, idempotency key, and normalized request return one job. Reusing the key for a different request returns HTTP `409` (`idempotency_conflict`).
-- On service startup, leftover `queued` and `running` jobs become `failed` with error code `interrupted`. Saved outputs are retained, and requests are not automatically resent. The `providers` and `login` commands do not run job recovery.
+- On service startup, leftover `queued`, `running`, and `cancelling` jobs become `failed` with error code `interrupted`. Saved outputs are retained, and requests are not automatically resent. The `providers` and `login` commands do not run job recovery.
 - Idempotency keys remain associated with terminal jobs, including failures and `needs_login`. A deliberate new attempt uses a new key or omits it.
 - If some artifacts cannot be staged, the job becomes `failed` with `artifact_collection_failed`. Generated text and successful artifacts remain accessible; `error.details.failures` lists each failed candidate's zero-based index and error code. All candidates are attempted unless the job times out.
+
+## Readiness and cancellation
+
+Generation requests and output formats retain the v1 contract. These are additional management operations, not official model API endpoints. Check the provider capability declaration before using optional operations.
+
+`POST /v1/providers/:id/check` (client: `checkProvider(id)`) sends no model prompt. It returns `{ provider, status, checkedAt, error }`, where `status` is `ready`, `needs_login`, `busy`, or `unknown`. Only `ready` positively confirms readiness at that instant. A busy provider is not probed and is not classified as signed out; checks have exclusive use of the provider and new jobs wait for them. Browser profile contention from another process also reports `busy`. Other failures report `unknown` without exposing internal paths or causes. Unsupported checks return HTTP 422. `/health` and `/v1/providers` do not check authentication. Each generation still performs its own pre-submission login check.
+
+`POST /v1/jobs/:id/cancel` (client: `cancel(id)`) is idempotent and retains the job and outputs. Queued jobs move directly to `cancelled` and never execute. Running jobs move to `cancelling`; adapters receive an abort signal, stop local operations and release their resources before the job becomes `cancelled`. Adapters that do not declare running cancellation return HTTP 422. Terminal jobs, including completed jobs, retain their existing status and output. Per-job writes serialize cancellation, submission reporting and completion so the first committed terminal outcome wins.
+
+`capabilities.cancellation` declares queued/running support and `scope: "local_execution"`; `readinessCheck` declares the optional check. `submissionTracking` declares whether an adapter records submission progress. Jobs expose `submission: "not_sent" | "unknown" | "confirmed"`. Bundled browser adapters persist `unknown` immediately before clicking Send and `confirmed` after verifying the submitted message. Providers without tracking report `unknown` once execution starts. Cancellation metadata records `requestedAt`, `scope`, and `upstreamStopped`: `not_applicable` for work known not to have been submitted, otherwise `unknown`. Closing a browser does not establish that the website's servers stopped generation and does not imply a quota refund.
+
+`cancelled` is terminal; `cancelling` is not. Client polling timeout or abort only stops waiting and never implicitly cancels a job. Execution timeout starts when the job leaves the queue; it excludes queue time. A client must explicitly request cancellation and reconcile the persisted job after a connection failure. Retrying a submit with the same key retrieves the same job even if it has been cancelled; deliberate re-execution requires a new key.
+
+Provider authors: implement optional `check({ timeoutMs })` with no generation; resolve when ready, throw `needs_login` or `profile_busy` when known, and release resources before returning. Declare only implemented lifecycle capabilities. Providers with submission tracking must await `context.reportSubmission("unknown")` before attempting Send and `context.reportSubmission("confirmed")` after verification. Running cancellation requires honouring `context.signal` and releasing the task's resources before generation settles.
 
 ## Browser login
 
@@ -107,7 +158,7 @@ ChatGPT's profile can be configured with `WEB2API_OPENAI_PROFILE_DIR` and `WEB2A
 
 ChatGPT requests use a dedicated **headed Chrome window minimized immediately after launch**, rather than headless Chrome. The login command remains visibly interactive. At OS launch the window may briefly appear; if minimization cannot be verified, the job fails with `background_window_unavailable` before sending any prompt. This is the current OpenAI-specific default because the same logged-in profile was repeatedly blocked in headless Chrome.
 
-ChatGPT requests open a new chat, explicitly select **Chat** rather than the website's possibly remembered Work surface, and check the selected radio state again immediately before sending. Missing or ineffective controls fail with `chat_mode_unavailable`; a mode change during prompt entry fails with `chat_mode_changed`. Neither failure submits the prompt. Successful results include `providerMetadata.mode: "chat"`.
+ChatGPT requests open a new chat unless continuing a saved conversation, explicitly select **Chat** rather than the website's possibly remembered Work surface, and check the selected radio state again immediately before sending. Missing or ineffective controls fail with `chat_mode_unavailable`; a mode change during prompt entry fails with `chat_mode_changed`. Neither failure submits the prompt. Successful results include `providerMetadata.mode: "chat"`.
 
 After sending, the adapter confirms the user message and waits for the new assistant turn's completion controls and stable text. Generation errors, unconfirmed submissions, and rate limits are not retried automatically. A Cloudflare challenge returns `browser_verification_required`; the service does not solve it or treat the challenge page as an answer. Cloudflare [does not support automated browsers for production challenges](https://developers.cloudflare.com/cloudflare-challenges/reference/supported-browsers/), so completing login in a visible window does not guarantee that later headless requests will work.
 

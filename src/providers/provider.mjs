@@ -13,6 +13,11 @@ export function browserCapabilities({
   artifacts = { downloadableFiles: false, generatedImages: false },
   login = "none",
   modelSelection = false,
+  readinessCheck = false,
+  runningCancellation = false,
+  submissionTracking = false,
+  maxConcurrency = 1,
+  nativeConversations = false,
 } = {}) {
   return {
     input: { text: true, localFiles },
@@ -24,5 +29,10 @@ export function browserCapabilities({
     modelSelection,
     tokenUsage: false,
     session: login === "persistent_local_profile" ? "persistent_local_profile" : "none",
+    conversations: { native: nativeConversations, turnOrder: "fifo", uncertainTurn: "blocked" },
+    readinessCheck,
+    cancellation: { queued: true, running: runningCancellation, scope: "local_execution" },
+    submissionTracking,
+    scheduling: { order: "fifo", maxConcurrency },
   };
 }

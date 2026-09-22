@@ -2,6 +2,44 @@ import { mkdir } from "node:fs/promises";
 import { chromium } from "playwright-core";
 import { ProviderError } from "./provider.mjs";
 
+// One persistent profile owner, separate pages per job. Releasing one job must
+// never close the browser underneath another job (including on cancellation).
+export class BrowserPagePool {
+  #serial = Promise.resolve();
+  #context = null;
+  #leases = 0;
+  constructor(settings, options) { this.settings = settings; this.options = options; }
+  #exclusive(task) {
+    const next = this.#serial.catch(() => {}).then(task);
+    this.#serial = next;
+    return next;
+  }
+  acquire() {
+    return this.#exclusive(async () => {
+      let page;
+      if (!this.#context) {
+        const session = await launchBrowser(this.settings, this.options);
+        this.#context = session.context;
+        page = session.page;
+      } else {
+        page = await this.#context.newPage();
+      }
+      this.#leases++;
+      let released = false;
+      return { page, release: () => this.#exclusive(async () => {
+        if (released) return;
+        released = true;
+        await page.close().catch(() => {});
+        if (--this.#leases === 0) {
+          const context = this.#context;
+          this.#context = null;
+          await context.close();
+        }
+      }) };
+    });
+  }
+}
+
 export async function minimizeBrowserWindow(context, page, { displayName } = {}) {
   let session;
   try {
