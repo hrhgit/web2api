@@ -66,6 +66,39 @@ test("local HTTP API advertises providers and completes a mock job", async () =>
   }
 });
 
+test("model discovery has a dedicated authenticated endpoint and never exposes adapter state", async () => {
+  const provider = {
+    id: "selectable-web",
+    capabilities: browserCapabilities({ modelSelection: true }),
+    async listModels() {
+      return [{ id: "fast", label: "Fast", selected: true, available: true }];
+    },
+    async generate() { return { text: "ok", outputEnforcement: "test" }; },
+  };
+  const { gateway } = await createWeb2ApiApp({
+    dataDirectory: await mkdtemp(path.join(os.tmpdir(), "web2api-model-catalog-")),
+    providers: [provider],
+  });
+  const server = createApiServer({ gateway, token: "test-token" });
+  const address = await listenLocal(server, { port: 0 });
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  try {
+    assert.equal((await fetch(`${baseUrl}/v1/providers/${provider.id}/models`, { method: "POST" })).status, 401);
+    const response = await fetch(`${baseUrl}/v1/providers/${provider.id}/models`, {
+      method: "POST",
+      headers: { authorization: "Bearer test-token" },
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.provider, provider.id);
+    assert.equal(body.status, "ready");
+    assert.deepEqual(body.models, [{ id: "fast", label: "Fast", selected: true, available: true }]);
+    assert.equal(JSON.stringify(body).includes("profile"), false);
+  } finally {
+    await close(server);
+  }
+});
+
 test("local HTTP API serves retained text and downloadable files even when another artifact fails", async () => {
   const provider = {
     id: "artifact-web",

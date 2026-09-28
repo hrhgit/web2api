@@ -82,6 +82,7 @@ export class Web2ApiGateway {
   #submissions = new SerialTaskQueue();
   #controllers = new Map();
   #checks = new Map();
+  #modelLists = new Map();
   #conversations = new Map();
 
   constructor({ dataDirectory, providers = [] }) {
@@ -153,6 +154,43 @@ export class Web2ApiGateway {
     this.#checks.set(id, pending);
     try { return await pending; }
     finally { this.#checks.delete(id); }
+  }
+
+  async listModels(id) {
+    const provider = this.getProvider(id);
+    if (!provider) throw new ApiError("provider_not_found", "Provider is not registered.", { status: 404 });
+    if (provider.capabilities.modelSelection !== true || typeof provider.listModels !== "function") {
+      throw new ApiError("unsupported_feature", "This provider does not support model discovery.", { status: 422 });
+    }
+    const result = (status, models = [], error = null) => ({
+      provider: id,
+      status,
+      discoveredAt: new Date().toISOString(),
+      models,
+      error,
+    });
+    if (this.#checks.has(id) || this.#modelLists.has(id) || this.queues.get(id).size) return result("busy");
+    const pending = Promise.resolve().then(async () => {
+      try {
+        const models = await provider.listModels({ timeoutMs: 30_000 });
+        if (!Array.isArray(models) || models.some((model) => !model || typeof model.id !== "string" || !model.id ||
+          typeof model.label !== "string" || !model.label || typeof model.selected !== "boolean" || typeof model.available !== "boolean")) {
+          throw new TypeError("Provider returned an invalid model list.");
+        }
+        return result("ready", models.map(({ id: modelId, label, selected, available }) => ({ id: modelId, label, selected, available })));
+      } catch (error) {
+        const status = error.code === "needs_login" ? "needs_login" : error.code === "profile_busy" ? "busy" : "unknown";
+        return result(status, [], {
+          code: status === "unknown" ? "model_discovery_failed" : error.code,
+          message: status === "unknown"
+            ? "Provider model choices could not be determined."
+            : status === "busy" ? "Provider is busy." : "Provider login is required.",
+        });
+      }
+    });
+    this.#modelLists.set(id, pending);
+    try { return await pending; }
+    finally { this.#modelLists.delete(id); }
   }
 
   async cancelJob(id) {
@@ -252,6 +290,7 @@ export class Web2ApiGateway {
 
   async #run(jobId, provider, request) {
     await this.#checks.get(provider.id);
+    await this.#modelLists.get(provider.id);
     const controller = new AbortController();
     this.#controllers.set(jobId, controller);
     const timeout = setTimeout(() => controller.abort(new Error("Job timed out.")), request.timeoutMs);

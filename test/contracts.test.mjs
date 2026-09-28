@@ -58,9 +58,10 @@ test("model selection is validated against the selected provider", () => {
     (error) => error.code === "unsupported_feature" && error.status === 422);
 });
 
-test("Gemini accepts its declared text extraction formats", () => {
+test("Gemini accepts its declared text extraction formats and model selection", () => {
   const provider = new GeminiWebProvider();
   assert.deepEqual(provider.capabilities.output.formats, ["text", "markdown", "latex"]);
+  assert.equal(provider.capabilities.modelSelection, true);
   assert.equal(provider.uploadMethod, "menu");
   assert.equal(provider.attachmentSettleMs, 2_000);
   assert.equal(new GeminiWebProvider({ uploadMethod: "native", attachmentSettleMs: 0 }).uploadMethod, "native");
@@ -69,6 +70,8 @@ test("Gemini accepts its declared text extraction formats", () => {
     const request = normalizeGenerationRequest({ provider: provider.id, input: [{ type: "text", text: "hello" }], output: { format } });
     assert.doesNotThrow(() => assertProviderSupportsRequest(provider, request));
   }
+  const modelRequest = normalizeGenerationRequest({ provider: provider.id, model: "gemini-pro", input: [{ type: "text", text: "hello" }] });
+  assert.doesNotThrow(() => assertProviderSupportsRequest(provider, modelRequest));
   const request = normalizeGenerationRequest({ provider: "text-only", input: [{ type: "text", text: "hello" }], output: { format: "markdown" } });
   assert.throws(() => assertProviderSupportsRequest({ id: request.provider, capabilities: browserCapabilities() }, request),
     (error) => error.code === "unsupported_feature");
@@ -84,13 +87,16 @@ test("requires explicit task text and an absolute local file path", () => {
   );
 });
 
-test("OpenAI declares text extraction and rejects unimplemented attachment and model controls", () => {
+test("OpenAI declares text extraction, Chat-only model selection, and rejects attachments", () => {
   const provider = new OpenAIWebProvider();
+  assert.equal(provider.capabilities.modelSelection, true);
   for (const format of ["text", "markdown", "latex"]) {
     const request = normalizeGenerationRequest({ provider: provider.id, input: [{ type: "text", text: "hello" }], output: { format } });
     assert.doesNotThrow(() => assertProviderSupportsRequest(provider, request));
   }
-  for (const extra of [{ model: "some-model" }, { input: [{ type: "text", text: "hello" }, { type: "local_file", path: "/tmp/input.txt" }] }]) {
+  const modelRequest = normalizeGenerationRequest({ provider: provider.id, model: "high", input: [{ type: "text", text: "hello" }] });
+  assert.doesNotThrow(() => assertProviderSupportsRequest(provider, modelRequest));
+  for (const extra of [{ input: [{ type: "text", text: "hello" }, { type: "local_file", path: "/tmp/input.txt" }] }]) {
     const request = normalizeGenerationRequest({ provider: provider.id, input: [{ type: "text", text: "hello" }], ...extra });
     assert.throws(() => assertProviderSupportsRequest(provider, request), (error) => error.code === "unsupported_feature" && error.status === 422);
   }

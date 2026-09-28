@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import test from "node:test";
@@ -24,7 +25,8 @@ test("npm pack dry-run contains only the public runtime package", async () => {
   assert.equal(result.code, 0, result.stderr);
   const pack = JSON.parse(result.stdout);
   assert.equal(pack.length, 1);
-  assert.equal(pack[0].id, "@ruihuahe/web2api@0.2.0");
+  const manifest = JSON.parse(await readFile(path.join(repositoryDirectory, "package.json"), "utf8"));
+  assert.equal(pack[0].id, `${manifest.name}@${manifest.version}`);
 
   const files = new Set(pack[0].files.map((file) => file.path.replace(/^package\//u, "")));
   assert.equal(files.has("LICENSE"), true);

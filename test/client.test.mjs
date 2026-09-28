@@ -6,14 +6,15 @@ import test from "node:test";
 import { Web2ApiClient, Web2ApiClientError } from "../src/client.mjs";
 import { createWeb2ApiApp } from "../src/app.mjs";
 import { createApiServer, listenLocal } from "../src/server.mjs";
+import { browserCapabilities } from "../src/providers/provider.mjs";
 
 async function close(server) {
   await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 }
 
-async function createTestService(t, token = null) {
+async function createTestService(t, token = null, providers = null) {
   const dataDirectory = await mkdtemp(path.join(os.tmpdir(), "web2api-client-"));
-  const { gateway } = await createWeb2ApiApp({ dataDirectory });
+  const { gateway } = await createWeb2ApiApp({ dataDirectory, ...(providers ? { providers } : {}) });
   const server = createApiServer({ gateway, token });
   const address = await listenLocal(server, { port: 0 });
   t.after(() => close(server));
@@ -41,6 +42,20 @@ test("client submits and polls a mock-web job", async (t) => {
   assert.equal(completed.output.text, "# Mock web response\n\nMock provider received: hello from client\n");
   assert.equal(completed.output.format, "markdown");
   assert.equal((await client.getJob(submitted.id)).id, submitted.id);
+});
+
+test("client discovers account-scoped model choices", async (t) => {
+  const provider = {
+    id: "selectable-web",
+    capabilities: browserCapabilities({ modelSelection: true }),
+    async listModels() { return [{ id: "high", label: "High", selected: false, available: true }]; },
+    async generate() { return { text: "answer", outputEnforcement: "test" }; },
+  };
+  const { baseUrl } = await createTestService(t, null, [provider]);
+  const client = new Web2ApiClient({ baseUrl });
+  const catalog = await client.listModels(provider.id);
+  assert.equal(catalog.status, "ready");
+  assert.deepEqual(catalog.models, [{ id: "high", label: "High", selected: false, available: true }]);
 });
 
 test("client sends bearer authentication and exposes API errors", async (t) => {

@@ -6,6 +6,12 @@ import { browserCapabilities, ProviderError } from "./provider.mjs";
 import { extractResponseText } from "./extract-response.mjs";
 import { attachGeminiFile, attachmentNames, inspectGeminiUploadPage } from "./local-files.mjs";
 import { createUploadDebugLogger, summarizeError } from "./diagnostics.mjs";
+import {
+  assertModelOptionSelected,
+  discoverModelOptions,
+  selectModelOption,
+  SubmissionGate,
+} from "./model-picker.mjs";
 
 const GEMINI_URL = "https://gemini.google.com/app";
 const PROMPT_SELECTOR = '[role="textbox"][contenteditable="true"]';
@@ -13,6 +19,26 @@ const ACCOUNT_SELECTOR = 'a[href*="accounts.google.com/SignOutOptions"], a[aria-
 const SIGN_IN_SELECTOR = 'a[href*="accounts.google.com/ServiceLogin"], a[href*="accounts.google.com/signin"]';
 const USER_QUERY_SELECTOR = 'user-query, [data-message-author-role="user"]';
 const MODEL_RESPONSE_SELECTOR = 'model-response, [data-message-author-role="model"]';
+const MODEL_PICKER = {
+  displayName: "Gemini",
+  pickerSelectors: [
+    'button[data-testid="bard-mode-menu-button"]',
+    'button[data-test-id="bard-mode-menu-button"]',
+    'button[data-testid*="model-picker"]',
+    'button[data-test-id*="model-picker"]',
+    '[role="button"][data-testid*="model-picker"]',
+    '[role="button"][data-test-id*="model-picker"]',
+    'button[aria-haspopup="menu"][aria-label*="model" i]',
+  ],
+  optionSelector: [
+    '[role="menu"] [role="menuitemradio"]',
+    '[role="menu"] [role="menuitem"]',
+    '[role="listbox"] [role="option"]',
+    '[role="dialog"] [role="option"]',
+    '[data-testid*="model-menu"] [role="option"]',
+    '[data-test-id*="model-menu"] [role="option"]',
+  ].join(", "),
+};
 
 function normalizeText(value) {
   return String(value).replace(/\s+/gu, " ").trim();
@@ -159,6 +185,7 @@ export class GeminiWebProvider {
       outputFormats: ["text", "markdown", "latex"],
       login: "persistent_local_profile",
       artifacts: { downloadableFiles: false, generatedImages: false },
+      modelSelection: true,
       readinessCheck: true,
       runningCancellation: true,
       submissionTracking: true,
@@ -174,6 +201,10 @@ export class GeminiWebProvider {
     this.attachmentSettleMs = Number.isFinite(attachmentSettleMs) ? Math.max(0, Math.min(30_000, attachmentSettleMs)) : 0;
     this.uploadMethod = options.uploadMethod ?? process.env.WEB2API_GEMINI_UPLOAD_METHOD ?? "menu";
     this.pool = new BrowserPagePool(this.settings, { displayName: this.displayName });
+    // The profile can hold a shared model preference even when each job owns a
+    // different page. Keep selection and submission atomic, but let responses
+    // continue concurrently after the website confirms the user message.
+    this.submissionGate = new SubmissionGate();
     this.uploadLog = options.log ?? createUploadDebugLogger();
   }
 
@@ -191,6 +222,17 @@ export class GeminiWebProvider {
       await page.goto(GEMINI_URL, { waitUntil: "domcontentloaded" });
       await waitForLogin(page, timeoutMs);
       return { provider: this.id, status: "ready" };
+    } finally {
+      await context.close().catch(() => {});
+    }
+  }
+
+  async listModels({ timeoutMs = 30_000 } = {}) {
+    const { context, page } = await launchBrowser(this.settings, { displayName: this.displayName });
+    try {
+      await page.goto(GEMINI_URL, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+      await waitForGeminiReady(page, timeoutMs);
+      return await discoverModelOptions(page, MODEL_PICKER, { timeoutMs });
     } finally {
       await context.close().catch(() => {});
     }
@@ -244,49 +286,61 @@ export class GeminiWebProvider {
         await page.waitForTimeout(this.attachmentSettleMs);
         log("gemini_attachment_settle_finished", { milliseconds: this.attachmentSettleMs });
       }
-      const prompt = composePrompt(request);
-      const previousMessages = await submittedMessages(page);
-      const editor = page.locator(PROMPT_SELECTOR);
-      await editor.fill(prompt);
-      if (normalizeText(await editor.innerText()) !== normalizeText(prompt)) {
-        throw new ProviderError("composer_mismatch", "Gemini's composer did not retain the submitted prompt.");
-      }
-      const send = page.getByRole("button", { name: /^(send|send message|submit|发送|发送消息)$/iu });
-      signal?.throwIfAborted();
-      log("gemini_before_submit", { url: page.url(), userMessageCount: previousMessages.length });
-      if (conversationUrl) {
-        assertConversationPage(page, conversationUrl, this.id);
-        const state = await getModelState(page, format);
-        if (state.busy || state.count !== baseline.count || state.text !== baseline.text || (await submittedMessages(page)).length !== previousMessages.length) {
-          throw new ProviderError("conversation_busy", "Conversation changed before submission. No follow-up was sent.");
+      const modelSelection = await this.submissionGate.run(async () => {
+        signal?.throwIfAborted();
+        const selection = request.model
+          ? await selectModelOption(page, request.model, MODEL_PICKER, { timeoutMs: Math.min(request.timeoutMs, 30_000) })
+          : null;
+        const prompt = composePrompt(request);
+        const previousMessages = await submittedMessages(page);
+        const editor = page.locator(PROMPT_SELECTOR);
+        await editor.fill(prompt);
+        if (normalizeText(await editor.innerText()) !== normalizeText(prompt)) {
+          throw new ProviderError("composer_mismatch", "Gemini's composer did not retain the submitted prompt.");
         }
-      }
-      await reportSubmission("unknown");
-      await send.click({ timeout: 120_000 });
-      log("gemini_send_clicked", { url: page.url() });
-      await page.waitForFunction(
-        ({ selector, previousCount, expected, attachments }) => {
-          const nodes = [...document.querySelectorAll(selector)];
-          if (nodes.length <= previousCount) return false;
-          const node = nodes.at(-1);
-          const lines = [...node.querySelectorAll(".query-text-line")];
-          const text = (lines.length ? lines.map((line) => line.textContent).join("\n") : node.textContent || "")
-            .replace(/\s+/gu, " ").trim();
-          const submittedFiles = [...node.querySelectorAll('[data-test-id="uploaded-file"], user-query-file-preview')]
-            .map((file) => `${file.getAttribute("aria-label") || ""} ${file.textContent || ""}`);
-          return text === expected && attachments.every((names) => submittedFiles.some((label) => names.some((name) => label.includes(name))));
-        },
-        { selector: USER_QUERY_SELECTOR, previousCount: previousMessages.length, expected: normalizeText(prompt),
-          attachments: request.input.filter((item) => item.type === "local_file").map((item) => attachmentNames(item.path)) },
-        { timeout: 30_000, polling: 250 },
-      ).catch((error) => {
-        throw new ProviderError("submission_unconfirmed", "Gemini did not confirm the submitted prompt; web2api will not send a duplicate request.", { cause: error });
-      });
-      await reportSubmission("confirmed");
-      log("gemini_submission_confirmed", {
-        url: page.url(),
-        userMessageCount: await page.locator(USER_QUERY_SELECTOR).count(),
-        attachmentNames: request.input.filter((item) => item.type === "local_file").map((item) => attachmentNames(item.path)),
+        if (selection) {
+          await assertModelOptionSelected(page, selection.selected, MODEL_PICKER, {
+            timeoutMs: Math.min(request.timeoutMs, 10_000),
+          });
+        }
+        const send = page.getByRole("button", { name: /^(send|send message|submit|发送|发送消息)$/iu });
+        signal?.throwIfAborted();
+        log("gemini_before_submit", { url: page.url(), userMessageCount: previousMessages.length });
+        if (conversationUrl) {
+          assertConversationPage(page, conversationUrl, this.id);
+          const state = await getModelState(page, format);
+          if (state.busy || state.count !== baseline.count || state.text !== baseline.text || (await submittedMessages(page)).length !== previousMessages.length) {
+            throw new ProviderError("conversation_busy", "Conversation changed before submission. No follow-up was sent.");
+          }
+        }
+        await reportSubmission("unknown");
+        await send.click({ timeout: 120_000 });
+        log("gemini_send_clicked", { url: page.url() });
+        await page.waitForFunction(
+          ({ selector, previousCount, expected, attachments }) => {
+            const nodes = [...document.querySelectorAll(selector)];
+            if (nodes.length <= previousCount) return false;
+            const node = nodes.at(-1);
+            const lines = [...node.querySelectorAll(".query-text-line")];
+            const text = (lines.length ? lines.map((line) => line.textContent).join("\n") : node.textContent || "")
+              .replace(/\s+/gu, " ").trim();
+            const submittedFiles = [...node.querySelectorAll('[data-test-id="uploaded-file"], user-query-file-preview')]
+              .map((file) => `${file.getAttribute("aria-label") || ""} ${file.textContent || ""}`);
+            return text === expected && attachments.every((names) => submittedFiles.some((label) => names.some((name) => label.includes(name))));
+          },
+          { selector: USER_QUERY_SELECTOR, previousCount: previousMessages.length, expected: normalizeText(prompt),
+            attachments: request.input.filter((item) => item.type === "local_file").map((item) => attachmentNames(item.path)) },
+          { timeout: 30_000, polling: 250 },
+        ).catch((error) => {
+          throw new ProviderError("submission_unconfirmed", "Gemini did not confirm the submitted prompt; web2api will not send a duplicate request.", { cause: error });
+        });
+        await reportSubmission("confirmed");
+        log("gemini_submission_confirmed", {
+          url: page.url(),
+          userMessageCount: await page.locator(USER_QUERY_SELECTOR).count(),
+          attachmentNames: request.input.filter((item) => item.type === "local_file").map((item) => attachmentNames(item.path)),
+        });
+        return selection;
       });
       const response = await waitForModelResponse(page, baseline, { timeoutMs: request.timeoutMs, signal, format, log });
       if (conversationUrl) assertConversationPage(page, conversationUrl, this.id);
@@ -295,7 +349,11 @@ export class GeminiWebProvider {
         text: response.text,
         outputEnforcement: "dom_extraction",
         artifacts: [],
-        providerMetadata: { conversationUrl: page.url(), extraction: response.extraction },
+        providerMetadata: {
+          conversationUrl: page.url(),
+          extraction: response.extraction,
+          ...(modelSelection ? { modelSelection } : {}),
+        },
       };
     } catch (error) {
       log("gemini_generation_failed", { url: page.url(), error: summarizeError(error) });

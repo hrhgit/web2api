@@ -190,6 +190,49 @@ test("capability-approved model selection reaches the provider and public job", 
   assert.equal(result.request.model, "web-model-a");
 });
 
+test("model discovery is account-scoped, safe to expose, and blocks generation while the picker is open", async (t) => {
+  const discoveryStarted = Promise.withResolvers();
+  const releaseDiscovery = Promise.withResolvers();
+  let generated = 0;
+  const provider = {
+    id: "selectable-catalog",
+    capabilities: browserCapabilities({ modelSelection: true }),
+    async listModels() {
+      discoveryStarted.resolve();
+      await releaseDiscovery.promise;
+      return [
+        { id: "fast", label: "Fast", selected: true, available: true },
+        { id: "pro", label: "Pro", selected: false, available: false },
+      ];
+    },
+    async generate() { generated++; return { text: "answer", outputEnforcement: "test" }; },
+  };
+  const gateway = await reviewGateway(t, [provider]);
+  const pending = gateway.listModels(provider.id);
+  await discoveryStarted.promise;
+  const busy = await gateway.listModels(provider.id);
+  assert.equal(busy.status, "busy");
+  assert.deepEqual(busy.models, []);
+  const queued = await gateway.submit({ provider: provider.id, input: [{ type: "text", text: "hello" }] });
+  assert.equal(queued.status, "queued");
+  assert.equal(generated, 0);
+  releaseDiscovery.resolve();
+  const discovered = await pending;
+  assert.equal(discovered.status, "ready");
+  assert.deepEqual(discovered.models, [
+    { id: "fast", label: "Fast", selected: true, available: true },
+    { id: "pro", label: "Pro", selected: false, available: false },
+  ]);
+  assert.equal((await gateway.waitForTerminal(queued.id)).status, "completed");
+  assert.equal(generated, 1);
+});
+
+test("model discovery is explicitly unsupported when an adapter has no catalog", async (t) => {
+  const provider = new RecordingProvider();
+  const gateway = await reviewGateway(t, [provider]);
+  await assert.rejects(() => gateway.listModels(provider.id), (error) => error.code === "unsupported_feature" && error.status === 422);
+});
+
 test("admission serialization preserves per-provider FIFO and cross-provider concurrency", async (t) => {
   const started = Promise.withResolvers();
   const release = Promise.withResolvers();

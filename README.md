@@ -6,7 +6,7 @@ This is a same-machine service, not a public or remotely deployable model API. I
 
 The project separates a job/artifact contract from provider-specific browser automation. A caller can submit text and supported local attachments, inspect a job, and retrieve safely staged provider artifacts. Output formats are checked against the selected provider's capabilities.
 
-## What v0.2 includes
+## What the current checkout includes
 
 - Local-only HTTP job API (`127.0.0.1` by default)
 - Persistent jobs, concurrent-safe idempotency within one service process, explicit `needs_login` state, and per-provider FIFO admission with declared concurrency
@@ -15,19 +15,20 @@ The project separates a job/artifact contract from provider-specific browser aut
 - Text, Markdown structure, and LaTeX formula-source extraction from provider response DOMs
 - A deterministic `mock-web` provider for integration tests and client development
 - A Gemini Web adapter for text/local-file turns through a dedicated Playwright Chrome profile
-- A ChatGPT Web adapter (`openai-web`) for text turns through its own persistent Chrome profile
+- A ChatGPT Web adapter (`openai-web`) for **Chat-only** text turns through its own persistent Chrome profile
+- Account-scoped model discovery and per-job browser-UI model selection for Gemini and ChatGPT Chat
 
 Neither web adapter collects generated downloads or images yet. The common artifact contract is in place so that capability can be added without changing callers. ChatGPT currently accepts text input only; local attachments are rejected explicitly. Claude Web is not registered yet.
 
-| Provider | Text input | Local attachments | Text / Markdown / LaTeX extraction | Downloads / images |
-| --- | --- | --- | --- | --- |
-| `gemini-web` | Yes | Yes | Yes | No |
-| `openai-web` (ChatGPT) | Yes | No | Yes | No |
-| `mock-web` | Yes | No | Synthetic test output | No |
+| Provider | Text input | Local attachments | Text / Markdown / LaTeX extraction | Model selection | Downloads / images |
+| --- | --- | --- | --- | --- | --- |
+| `gemini-web` | Yes | Yes | Yes | Current profile options | No |
+| `openai-web` (ChatGPT) | Yes | No | Yes | **Chat only**, current profile options | No |
+| `mock-web` | Yes | No | Synthetic test output | No | No |
 
 ## Deliberate capability boundary
 
-Web UIs are session-driven products, not automatically equivalent to provider APIs. In particular, `web2api` v0.1 rejects `system`/`instructions` and `tools` rather than pretending they have native model semantics. It also does not claim token usage, temperature control, native JSON-schema mode, or token streaming. Optional `model` requests are accepted only when the selected adapter declares `modelSelection: true` and implements that selection; no bundled provider currently does. The website's selected model and account settings still apply.
+Web UIs are session-driven products, not automatically equivalent to provider APIs. In particular, `web2api` rejects `system`/`instructions` and `tools` rather than pretending they have native model semantics. It also does not claim token usage, temperature control, native JSON-schema mode, or token streaming. `model` is an opaque provider option ID discovered from the current account's visible web UI; it is not an official provider API model ID or a promise of backend routing. If the requested option is unavailable or cannot be confirmed, the job fails before sending the caller's prompt rather than falling back silently.
 
 Both web adapters submit the caller's text without adding formatting instructions. Their `text`, `markdown`, and `latex` formats select how the response DOM is extracted; all return a string in `output.text`, with `output.enforcement: "dom_extraction"`. The mock provider returns synthetic text for client tests and does not demonstrate real-site extraction.
 
@@ -93,6 +94,29 @@ curl -X POST http://127.0.0.1:8787/v1/jobs \
 
 Poll `GET /v1/jobs/<job-id>`. A completed job contains `output.text` and any staged `artifacts`; an artifact can be downloaded from its `downloadUrl`.
 
+## Model selection
+
+Check `/v1/providers` first. Only adapters declaring `capabilities.modelSelection: true` support the following dynamic catalog endpoint:
+
+```js
+const catalog = await client.listModels("gemini-web");
+if (catalog.status !== "ready") throw new Error(`Model picker unavailable: ${catalog.status}`);
+
+const requested = catalog.models.find((model) => model.available && model.selected)
+  ?? catalog.models.find((model) => model.available);
+if (!requested) throw new Error("No selectable model is available in this browser profile.");
+
+const job = await client.submit({
+  provider: "gemini-web",
+  model: requested.id,
+  input: [{ type: "text", text: "Explain Bayes rule." }],
+});
+```
+
+`POST /v1/providers/:id/models` opens the provider's dedicated browser profile but sends no prompt. Its result is `{ provider, status, discoveredAt, models, error }`; `status` is `ready`, `needs_login`, `busy`, or `unknown`. A `ready` catalog contains only safe public fields: `{ id, label, selected, available }`. IDs and labels are account-, plan-, workspace-, locale-, and rollout-dependent, so callers must discover them immediately before use instead of hard-coding a provider-wide list. A changing catalog returns an explicit `model_unavailable`, `model_selector_unavailable`, or `model_selection_unconfirmed` error; web2api never turns a model request into a prompt instruction or substitutes the page default.
+
+For a selected job, `providerMetadata.modelSelection` records the requested ID, the UI-confirmed option, and `source: "ui_selection"`. Gemini serializes the critical select/fill/send-confirmation interval across its browser pages, then allows responses to continue concurrently. ChatGPT discovery and selection explicitly establish **Chat** first, recheck it before submission, and never use or expose a Work picker. If Chat cannot be established, no model is selected and no caller input is sent.
+
 ## Native multi-turn conversations
 
 Gemini and ChatGPT support `conversationId: "new"` to create a conversation. The returned job immediately includes its actual `conversationId`; pass that ID on subsequent jobs to append questions to the same provider conversation. Omit the field for the existing independent-job behavior. Check `capabilities.conversations.native` first; `mock-web` does not implement native conversations.
@@ -132,7 +156,7 @@ Validation on 2026-09-22: a real Gemini conversation completed two queued turns 
 
 Generation requests and output formats retain the v1 contract. These are additional management operations, not official model API endpoints. Check the provider capability declaration before using optional operations.
 
-`POST /v1/providers/:id/check` (client: `checkProvider(id)`) sends no model prompt. It returns `{ provider, status, checkedAt, error }`, where `status` is `ready`, `needs_login`, `busy`, or `unknown`. Only `ready` positively confirms readiness at that instant. A busy provider is not probed and is not classified as signed out; checks have exclusive use of the provider and new jobs wait for them. Browser profile contention from another process also reports `busy`. Other failures report `unknown` without exposing internal paths or causes. Unsupported checks return HTTP 422. `/health` and `/v1/providers` do not check authentication. Each generation still performs its own pre-submission login check.
+`POST /v1/providers/:id/check` (client: `checkProvider(id)`) sends no model prompt. It returns `{ provider, status, checkedAt, error }`, where `status` is `ready`, `needs_login`, `busy`, or `unknown`. Only `ready` positively confirms readiness at that instant. A busy provider is not probed and is not classified as signed out; checks have exclusive use of the provider and new jobs wait for them. Browser profile contention from another process also reports `busy`. Other failures report `unknown` without exposing internal paths or causes. Unsupported checks return HTTP 422. `/health` and `/v1/providers` do not check authentication. Each generation still performs its own pre-submission login check. Model discovery has the same exclusive-use behavior, with its own `POST /v1/providers/:id/models` endpoint.
 
 `POST /v1/jobs/:id/cancel` (client: `cancel(id)`) is idempotent and retains the job and outputs. Queued jobs move directly to `cancelled` and never execute. Running jobs move to `cancelling`; adapters receive an abort signal, stop local operations and release their resources before the job becomes `cancelled`. Adapters that do not declare running cancellation return HTTP 422. Terminal jobs, including completed jobs, retain their existing status and output. Per-job writes serialize cancellation, submission reporting and completion so the first committed terminal outcome wins.
 
@@ -158,7 +182,7 @@ ChatGPT's profile can be configured with `WEB2API_OPENAI_PROFILE_DIR` and `WEB2A
 
 ChatGPT requests use a dedicated **headed Chrome window minimized immediately after launch**, rather than headless Chrome. The login command remains visibly interactive. At OS launch the window may briefly appear; if minimization cannot be verified, the job fails with `background_window_unavailable` before sending any prompt. This is the current OpenAI-specific default because the same logged-in profile was repeatedly blocked in headless Chrome.
 
-ChatGPT requests open a new chat unless continuing a saved conversation, explicitly select **Chat** rather than the website's possibly remembered Work surface, and check the selected radio state again immediately before sending. Missing or ineffective controls fail with `chat_mode_unavailable`; a mode change during prompt entry fails with `chat_mode_changed`. Neither failure submits the prompt. Successful results include `providerMetadata.mode: "chat"`.
+ChatGPT requests open a new chat unless continuing a saved conversation, explicitly select **Chat** rather than the website's possibly remembered Work surface, and check the selected radio state again immediately before sending. This applies equally to model discovery and model selection: web2api never uses the Work picker. Missing or ineffective controls fail with `chat_mode_unavailable`; a mode change during prompt entry fails with `chat_mode_changed`. Neither failure submits the prompt. Successful results include `providerMetadata.mode: "chat"`.
 
 After sending, the adapter confirms the user message and waits for the new assistant turn's completion controls and stable text. Generation errors, unconfirmed submissions, and rate limits are not retried automatically. A Cloudflare challenge returns `browser_verification_required`; the service does not solve it or treat the challenge page as an answer. Cloudflare [does not support automated browsers for production challenges](https://developers.cloudflare.com/cloudflare-challenges/reference/supported-browsers/), so completing login in a visible window does not guarantee that later headless requests will work.
 
@@ -169,6 +193,7 @@ Live validation on 2026-09-21: manual login succeeded in normal Chrome using the
 ```json
 {
   "provider": "gemini-web",
+  "model": "<id returned by POST /v1/providers/gemini-web/models>",
   "input": [
     {"type": "text", "text": "Summarize the attached paper."},
     {"type": "local_file", "path": "/absolute/path/to/paper.pdf"}
@@ -220,7 +245,7 @@ When a recognized formula has no exposed source, extraction retains its visible 
 
 ## Adding a provider
 
-A provider implements `id`, `capabilities`, `generate(request, context)`, and optionally `login()`. It returns `text`, an explicit `outputEnforcement`, and optionally an `artifacts` array. It must honor `context.signal`, release its browser on abort, and finish saving downloads before returning. Use `context.jobDirectory` for those files; paths to browser-owned temporary downloads may disappear when the browser closes. The gateway stages candidates inside its own data directory before publishing metadata or a download URL.
+A provider implements `id`, `capabilities`, `generate(request, context)`, and optionally `login()` and `listModels({ timeoutMs })` when it declares `modelSelection: true`. It returns `text`, an explicit `outputEnforcement`, and optionally an `artifacts` array. Model adapters must choose and independently verify the visible requested option before reporting submission; unavailable UI controls must fail without sending. They must honor `context.signal`, release their browser on abort, and finish saving downloads before returning. Use `context.jobDirectory` for those files; paths to browser-owned temporary downloads may disappear when the browser closes. The gateway stages candidates inside its own data directory before publishing metadata or a download URL.
 
 Provider error messages/details and result metadata are public API data. Keep local profile paths and credentials out of them; internal exception causes are not returned. Declare only capabilities the adapter actually implements.
 
@@ -244,4 +269,4 @@ npm run check
 npm run test:browser
 ```
 
-Browser regression tests require installed Google Chrome. They use isolated contexts and locally fulfilled pages to verify login redirects, unchanged prompt submission, error detection, Markdown structure, code whitespace, formula-source extraction, and ChatGPT job completion/cancellation without contacting AI services or using a signed-in profile. They do not verify current live provider selectors or real-account behavior.
+Browser regression tests require installed Google Chrome. They use isolated contexts and locally fulfilled pages to verify login redirects, unchanged prompt submission, model discovery/selection confirmation, error detection, Markdown structure, code whitespace, formula-source extraction, and ChatGPT Chat-only completion/cancellation without contacting AI services or using a signed-in profile. They do not replace a current live provider-selector or real-account validation.

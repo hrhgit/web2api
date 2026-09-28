@@ -14,6 +14,34 @@ const account = '<a aria-label="Google Account: Fixture" href="#">Fixture accoun
 const editor = '<div role="textbox" contenteditable="true"></div>';
 const signIn = '<a href="https://accounts.google.com/ServiceLogin">Sign in</a>';
 
+function modelControls(initial = "gemini-flash", { compactSummary = false } = {}) {
+  const options = [
+    ["gemini-flash", "Gemini Flash"],
+    ["gemini-pro", "Gemini Pro"],
+  ];
+  const [initialId, initialLabel] = options.find(([id]) => id === initial) || options[0];
+  const pickerLabel = compactSummary ? `Open mode picker, currently ${initialLabel.replace(/^Gemini /u, "")}` : initialLabel;
+  const pickerAttributes = compactSummary ? "" : ` data-model-id="${initialId}" data-model-label="${initialLabel}"`;
+  const pickerText = compactSummary ? initialLabel.replace(/^Gemini /u, "") : initialLabel;
+  return `<button data-testid="bard-mode-menu-button" aria-haspopup="menu"${pickerAttributes} aria-label="${pickerLabel}" onclick="toggleModelMenu()">${pickerText}</button>
+    <div id="model-menu" role="menu" hidden>${options.map(([id, label]) =>
+      `<button role="menuitemradio" data-model-id="${id}" data-model-label="${label}" aria-checked="${id === initialId}" onclick="chooseModel(this)">${label}</button>`,
+    ).join("")}</div>
+    <script>
+      function toggleModelMenu() { document.querySelector('#model-menu').hidden = !document.querySelector('#model-menu').hidden; }
+      function chooseModel(option) {
+        for (const entry of document.querySelectorAll('#model-menu [role=menuitemradio]')) entry.setAttribute('aria-checked', String(entry === option));
+        const picker = document.querySelector('[data-testid=bard-mode-menu-button]');
+        picker.dataset.modelId = option.dataset.modelId;
+        picker.dataset.modelLabel = option.dataset.modelLabel;
+        picker.setAttribute('aria-label', option.dataset.modelLabel);
+        picker.textContent = option.dataset.modelLabel;
+        document.querySelector('#model-menu').hidden = true;
+      }
+      document.addEventListener('keydown', (event) => { if (event.key === 'Escape') document.querySelector('#model-menu').hidden = true; });
+    </script>`;
+}
+
 async function fixtureProvider(t, renderPage) {
   const profileDirectory = await mkdtemp(path.join(os.tmpdir(), "web2api-browser-test-"));
   t.after(() => rm(profileDirectory, { recursive: true, force: true }));
@@ -33,8 +61,8 @@ async function fixtureProvider(t, renderPage) {
   };
 }
 
-function responsePage(responseHtml, notificationHtml = "") {
-  return `<!doctype html><body>${account}${editor}
+function responsePage(responseHtml, notificationHtml = "", { initialModel = "gemini-flash", changeModelOnInput = false, compactModelSummary = false } = {}) {
+  return `<!doctype html><body>${account}${modelControls(initialModel, { compactSummary: compactModelSummary })}${editor}
     <button aria-label="Send" onclick="send()">Send</button>
     <script>
       function send() {
@@ -48,6 +76,9 @@ function responsePage(responseHtml, notificationHtml = "") {
         document.body.append(response);
         document.body.insertAdjacentHTML('beforeend', ${JSON.stringify(notificationHtml)});
       }
+      if (${changeModelOnInput}) document.querySelector('[role="textbox"]').addEventListener('input', () => {
+        chooseModel(document.querySelector('[data-model-id="gemini-flash"]'));
+      });
     </script>`;
 }
 
@@ -127,6 +158,59 @@ test("readiness checks the composer without submitting a model prompt", async (t
   await fixture.provider.check({ timeoutMs: 3000 });
   assert.equal(fixture.submittedPrompt, null);
   assert.equal(fixture.context.pages().length, 0);
+});
+
+test("Gemini discovers account-visible model choices without submitting a prompt", async (t) => {
+  const fixture = await fixtureProvider(t, () => responsePage(""));
+  const models = await fixture.provider.listModels({ timeoutMs: 3000 });
+  assert.deepEqual(models, [
+    { id: "gemini-flash", label: "Gemini Flash", selected: true, available: true },
+    { id: "gemini-pro", label: "Gemini Pro", selected: false, available: true },
+  ]);
+  assert.equal(fixture.submittedPrompt, null);
+  assert.equal(fixture.context.pages().length, 0);
+});
+
+test("Gemini recognizes a compact current-model announcement", async (t) => {
+  const fixture = await fixtureProvider(t, () => responsePage("", "", { initialModel: "gemini-pro", compactModelSummary: true }));
+  const models = await fixture.provider.listModels({ timeoutMs: 3000 });
+  assert.deepEqual(models, [
+    { id: "gemini-flash", label: "Gemini Flash", selected: false, available: true },
+    { id: "gemini-pro", label: "Gemini Pro", selected: true, available: true },
+  ]);
+  assert.equal(fixture.submittedPrompt, null);
+});
+
+test("Gemini selects a discovered model and records UI confirmation", async (t) => {
+  const fixture = await fixtureProvider(t, () => responsePage("Selected result"));
+  const prompt = "Use the selected model.";
+  const result = await fixture.provider.generate({
+    model: "gemini-pro", input: [{ type: "text", text: prompt }], output: { format: "text" }, timeoutMs: 10_000,
+  });
+  assert.equal(fixture.submittedPrompt, prompt);
+  assert.deepEqual(result.providerMetadata.modelSelection, {
+    requested: "gemini-pro",
+    selected: { id: "gemini-pro", label: "Gemini Pro" },
+    source: "ui_selection",
+  });
+});
+
+test("Gemini rejects an unavailable model before submitting a prompt", async (t) => {
+  const fixture = await fixtureProvider(t, () => responsePage("Should not submit"));
+  await assert.rejects(
+    fixture.provider.generate({ model: "not-in-catalog", input: [{ type: "text", text: "never send" }], output: { format: "text" }, timeoutMs: 3000 }),
+    (error) => error.code === "model_unavailable",
+  );
+  assert.equal(fixture.submittedPrompt, null);
+});
+
+test("Gemini refuses submission when its selected model changes during prompt entry", async (t) => {
+  const fixture = await fixtureProvider(t, () => responsePage("Should not submit", "", { changeModelOnInput: true }));
+  await assert.rejects(
+    fixture.provider.generate({ model: "gemini-pro", input: [{ type: "text", text: "never send" }], output: { format: "text" }, timeoutMs: 3000 }),
+    (error) => error.code === "model_selection_changed",
+  );
+  assert.equal(fixture.submittedPrompt, null);
 });
 
 test("cancelling one Gemini job leaves the concurrent job's page and response intact", async (t) => {

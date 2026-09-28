@@ -24,6 +24,31 @@ function modeControls(initial = "chatgpt", canSwitch = true) {
   ).join("")}</div>`;
 }
 
+function modelControls(initial = "instant") {
+  const options = [["instant", "Instant"], ["high", "High"]];
+  const [initialId, initialLabel] = options.find(([id]) => id === initial) || options[0];
+  return `<button data-testid="model-switcher-dropdown-button" aria-haspopup="menu" data-model-id="${initialId}" data-model-label="${initialLabel}" aria-label="${initialLabel}" onclick="toggleModelMenu()">${initialLabel}</button>
+    <div id="model-menu" role="menu" hidden>${options.map(([id, label]) =>
+      `<button role="menuitemradio" data-model-id="${id}" data-model-label="${label}" aria-checked="${id === initialId}" onclick="chooseModel(this)">${label}</button>`,
+    ).join("")}</div>
+    <script>
+      function toggleModelMenu() {
+        captureModelPickerMode(document.querySelector('[role="radio"][aria-checked="true"]')?.getAttribute('data-tpp-toggle-value'));
+        document.querySelector('#model-menu').hidden = !document.querySelector('#model-menu').hidden;
+      }
+      function chooseModel(option) {
+        for (const entry of document.querySelectorAll('#model-menu [role=menuitemradio]')) entry.setAttribute('aria-checked', String(entry === option));
+        const picker = document.querySelector('[data-testid=model-switcher-dropdown-button]');
+        picker.dataset.modelId = option.dataset.modelId;
+        picker.dataset.modelLabel = option.dataset.modelLabel;
+        picker.setAttribute('aria-label', option.dataset.modelLabel);
+        picker.textContent = option.dataset.modelLabel;
+        document.querySelector('#model-menu').hidden = true;
+      }
+      document.addEventListener('keydown', (event) => { if (event.key === 'Escape') document.querySelector('#model-menu').hidden = true; });
+    </script>`;
+}
+
 function request(format = "text", timeoutMs = 5000) {
   return { provider: "openai-web", input: [{ type: "text", text: "Explain this.\nKeep the request unchanged." }], output: { format }, timeoutMs };
 }
@@ -35,11 +60,13 @@ async function fixtureProvider(t, renderPage) {
   t.after(() => context.close());
   const prompts = [];
   const submittedModes = [];
+  const modelPickerModes = [];
   await context.exposeBinding("capturePrompt", (_source, text, mode) => { prompts.push(text); submittedModes.push(mode); });
+  await context.exposeBinding("captureModelPickerMode", (_source, mode) => { modelPickerModes.push(mode); });
   await context.route("**/*", (route) => route.fulfill({ contentType: "text/html", body: renderPage(new URL(route.request().url())) }));
   const page = await context.newPage();
   t.mock.method(chromium, "launchPersistentContext", async () => context);
-  return { provider: new OpenAIWebProvider({ profileDirectory: path.join(directory, "profile"), background: false }), directory, context, page, prompts, submittedModes };
+  return { provider: new OpenAIWebProvider({ profileDirectory: path.join(directory, "profile"), background: false }), directory, context, page, prompts, submittedModes, modelPickerModes };
 }
 
 test("a ChatGPT generation defaults to a minimized headed window", () => {
@@ -81,8 +108,8 @@ test("an unverifiable background window fails before a prompt can be sent", asyn
   );
 });
 
-function responsePage({ html = answer, notification = "", confirm = true, respond = true, finishAfter = 0, before = "", mode = "chatgpt", canSwitch = true, changeModeOnInput = false } = {}) {
-  return `<!doctype html><body>${account}${mode ? modeControls(mode, canSwitch) : ""}${editor}${before}
+function responsePage({ html = answer, notification = "", confirm = true, respond = true, finishAfter = 0, before = "", mode = "chatgpt", canSwitch = true, changeModeOnInput = false, initialModel = "instant", changeModelOnInput = false } = {}) {
+  return `<!doctype html><body>${account}${mode ? modeControls(mode, canSwitch) : ""}${modelControls(initialModel)}${editor}${before}
     <button data-testid="send-button" onclick="send()">Send</button>
     <script>
       function send() {
@@ -114,6 +141,9 @@ function responsePage({ html = answer, notification = "", confirm = true, respon
       if (${changeModeOnInput}) document.querySelector('#prompt-textarea').addEventListener('input', () => {
         document.querySelector('[data-tpp-toggle-value="chatgpt"]').setAttribute('aria-checked', 'false');
         document.querySelector('[data-tpp-toggle-value="work"]').setAttribute('aria-checked', 'true');
+      });
+      if (${changeModelOnInput}) document.querySelector('#prompt-textarea').addEventListener('input', () => {
+        chooseModel(document.querySelector('#model-menu [data-model-id="instant"]'));
       });
     </script>`;
 }
@@ -173,6 +203,48 @@ test("a default Work surface switches to Chat before entering the caller's promp
   assert.deepEqual(fixture.submittedModes, ["chatgpt"]);
 });
 
+test("ChatGPT discovers models only after it has established Chat mode", async (t) => {
+  const fixture = await fixtureProvider(t, () => responsePage({ mode: "work" }));
+  const models = await fixture.provider.listModels({ timeoutMs: 3000 });
+  assert.deepEqual(models, [
+    { id: "instant", label: "Instant", selected: true, available: true },
+    { id: "high", label: "High", selected: false, available: true },
+  ]);
+  assert.deepEqual(fixture.modelPickerModes, ["chatgpt"]);
+  assert.deepEqual(fixture.prompts, []);
+});
+
+test("ChatGPT switches from Work to Chat before selecting a model and submitting", async (t) => {
+  const fixture = await fixtureProvider(t, () => responsePage({ mode: "work" }));
+  const submitted = { ...request(), model: "high" };
+  const result = await fixture.provider.generate(submitted);
+  assert.deepEqual(fixture.modelPickerModes, ["chatgpt", "chatgpt", "chatgpt"]);
+  assert.deepEqual(fixture.submittedModes, ["chatgpt"]);
+  assert.deepEqual(result.providerMetadata.modelSelection, {
+    requested: "high",
+    selected: { id: "high", label: "High" },
+    source: "ui_selection",
+  });
+});
+
+test("ChatGPT rejects an unavailable model before submitting a prompt", async (t) => {
+  const fixture = await fixtureProvider(t, () => responsePage());
+  await assert.rejects(
+    fixture.provider.generate({ ...request(), model: "not-in-catalog" }),
+    (error) => error.code === "model_unavailable",
+  );
+  assert.deepEqual(fixture.prompts, []);
+});
+
+test("ChatGPT refuses submission when the selected model changes during prompt entry", async (t) => {
+  const fixture = await fixtureProvider(t, () => responsePage({ changeModelOnInput: true }));
+  await assert.rejects(
+    fixture.provider.generate({ ...request(), model: "high" }),
+    (error) => error.code === "model_selection_changed",
+  );
+  assert.deepEqual(fixture.prompts, []);
+});
+
 for (const mode of ["work", null]) {
   test(`an unconfirmed Chat mode (${mode || "missing controls"}) fails without sending`, async (t) => {
     const fixture = await fixtureProvider(t, () => responsePage({ mode, canSwitch: false }));
@@ -190,7 +262,7 @@ test("a mode change during prompt entry is detected before submission", async (t
 test("Chat mode is rechecked after waiting for the send button to become enabled", async (t) => {
   const fixture = await fixtureProvider(t, () => responsePage()
     .replace('<button data-testid="send-button"', '<button disabled data-testid="send-button"')
-    .replace('</script>', `document.querySelector('#prompt-textarea').addEventListener('input', () => setTimeout(() => {
+    .replace(/<\/script>$/u, `document.querySelector('#prompt-textarea').addEventListener('input', () => setTimeout(() => {
       document.querySelector('[data-tpp-toggle-value="chatgpt"]').setAttribute('aria-checked', 'false');
       document.querySelector('[data-tpp-toggle-value="work"]').setAttribute('aria-checked', 'true');
       document.querySelector('[data-testid="send-button"]').disabled = false;

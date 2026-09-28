@@ -157,6 +157,10 @@ export class Web2ApiClient {
     return this.#json(`/v1/providers/${requireIdentifier(providerId, "providerId")}/check`, { method: "POST" });
   }
 
+  async listModels(providerId) {
+    return this.#json(`/v1/providers/${requireIdentifier(providerId, "providerId")}/models`, { method: "POST" });
+  }
+
   async cancel(jobId) {
     return this.#json(`/v1/jobs/${requireIdentifier(jobId, "jobId")}/cancel`, { method: "POST" });
   }

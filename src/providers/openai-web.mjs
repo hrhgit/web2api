@@ -5,6 +5,11 @@ import { assertProviderSupportsRequest } from "../core/contracts.mjs";
 import { launchBrowser } from "./browser-session.mjs";
 import { extractResponseText } from "./extract-response.mjs";
 import { browserCapabilities, ProviderError } from "./provider.mjs";
+import {
+  assertModelOptionSelected,
+  discoverModelOptions,
+  selectModelOption,
+} from "./model-picker.mjs";
 
 const CHATGPT_URL = "https://chatgpt.com/";
 const SELECTORS = {
@@ -17,6 +22,26 @@ const SELECTORS = {
   assistant: '[data-message-author-role="assistant"]',
   chatMode: '[role="radio"][data-tpp-toggle-value="chatgpt"]',
   workMode: '[role="radio"][data-tpp-toggle-value="work"]',
+};
+const MODEL_PICKER = {
+  displayName: "ChatGPT",
+  pickerSelectors: [
+    'button[data-testid="model-switcher-dropdown-button"]',
+    '[data-testid="model-switcher-dropdown-button"]',
+    'button[data-testid*="model-switcher"]',
+    '[role="button"][data-testid*="model-switcher"]',
+    'button[data-testid*="model-picker"]',
+    '[role="button"][data-testid*="model-picker"]',
+    'button[aria-haspopup="menu"][aria-label*="model" i]',
+  ],
+  optionSelector: [
+    '[role="menu"] [role="menuitemradio"]',
+    '[role="menu"] [role="menuitem"]',
+    '[role="listbox"] [role="option"]',
+    '[role="dialog"] [role="option"]',
+    '[data-testid*="model-switcher"] [role="menuitem"]',
+    '[data-testid*="model-picker"] [role="option"]',
+  ].join(", "),
 };
 
 function normalizeText(value) {
@@ -140,6 +165,7 @@ export class OpenAIWebProvider {
       outputFormats: ["text", "markdown", "latex"],
       nativeConversations: true,
       login: "persistent_local_profile",
+      modelSelection: true,
       readinessCheck: true,
       runningCancellation: true,
       submissionTracking: true,
@@ -176,6 +202,20 @@ export class OpenAIWebProvider {
     } finally { await context.close(); }
   }
 
+  async listModels({ timeoutMs = 30_000 } = {}) {
+    const { context, page } = await launchBrowser(this.settings, { background: this.background, displayName: this.displayName });
+    try {
+      await page.goto(CHATGPT_URL, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+      await waitForReady(page, timeoutMs);
+      // Model discovery has the same Chat-only boundary as generation. It must
+      // never discover or expose a Work-surface picker as a supported API mode.
+      await ensureChatMode(page, Math.min(timeoutMs, 30_000));
+      return await discoverModelOptions(page, MODEL_PICKER, { timeoutMs });
+    } finally {
+      await context.close().catch(() => {});
+    }
+  }
+
   async generate(request, { signal, conversationUrl = null, reportSubmission = async () => {} } = {}) {
     assertProviderSupportsRequest(this, request);
     signal?.throwIfAborted();
@@ -199,12 +239,23 @@ export class OpenAIWebProvider {
       if (request.conversationId && !conversationUrl && (previousUsers || previousResponses)) {
         throw new ProviderError("conversation_unavailable", "A fresh conversation could not be established. No prompt was sent.");
       }
+      if (!(await page.evaluate(chatModeSelected, SELECTORS))) {
+        throw new ProviderError("chat_mode_changed", "ChatGPT left Chat mode before model selection. No prompt was submitted.");
+      }
+      const modelSelection = request.model
+        ? await selectModelOption(page, request.model, MODEL_PICKER, { timeoutMs: Math.min(request.timeoutMs, 30_000) })
+        : null;
       const prompt = request.input.filter((item) => item.type === "text").map((item) => item.text).join("\n\n");
       const editor = page.locator(SELECTORS.prompt);
       await editor.fill(prompt);
       const actualPrompt = await editor.evaluate((node) => node instanceof HTMLTextAreaElement ? node.value : node.innerText);
       if (normalizeText(actualPrompt) !== normalizeText(prompt)) {
         throw new ProviderError("composer_mismatch", "ChatGPT's composer did not retain the submitted prompt.");
+      }
+      if (modelSelection) {
+        await assertModelOptionSelected(page, modelSelection.selected, MODEL_PICKER, {
+          timeoutMs: Math.min(request.timeoutMs, 10_000),
+        });
       }
       const sendReady = await page.waitForFunction((selector) => {
         const button = document.querySelector(selector);
@@ -240,7 +291,12 @@ export class OpenAIWebProvider {
         text: response.text,
         outputEnforcement: "dom_extraction",
         artifacts: [],
-        providerMetadata: { conversationUrl: page.url(), mode: "chat", extraction: response.extraction },
+        providerMetadata: {
+          conversationUrl: page.url(),
+          mode: "chat",
+          extraction: response.extraction,
+          ...(modelSelection ? { modelSelection } : {}),
+        },
       };
     } finally {
       signal?.removeEventListener("abort", closeOnAbort);
