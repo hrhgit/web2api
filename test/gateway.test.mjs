@@ -296,6 +296,36 @@ test("records needs_login without claiming the request was sent", async () => {
   assert.equal(finished.error.code, "needs_login");
 });
 
+test("unexpected provider failures retain safe phase, submission, timing, and root-cause diagnostics", async (t) => {
+  const provider = {
+    id: "diagnostic-web",
+    capabilities: browserCapabilities({ submissionTracking: true }),
+    async generate(_request, { reportSubmission }) {
+      await reportSubmission("unknown");
+      const error = new Error("Cookie=top-secret file:///Users/example/profile?token=also-secret");
+      error.code = "E_UNEXPECTED";
+      throw error;
+    },
+  };
+  const gateway = await reviewGateway(t, [provider]);
+  const queued = await gateway.submit({ provider: provider.id, input: [{ type: "text", text: "do not expose this" }] });
+  const failed = await gateway.waitForTerminal(queued.id);
+
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.error.code, "provider_failed");
+  assert.equal(failed.error.details.diagnostic.phase, "provider_generation");
+  assert.equal(failed.error.details.diagnostic.submission, "unknown");
+  assert.equal(failed.error.details.diagnostic.underlying.code, "E_UNEXPECTED");
+  assert.ok(failed.error.details.diagnostic.timing.startedAt);
+  assert.ok(failed.error.details.diagnostic.timing.failedAt);
+  assert.equal(typeof failed.error.details.diagnostic.timing.durationMs, "number");
+  const serialized = JSON.stringify(failed);
+  assert.equal(serialized.includes("top-secret"), false);
+  assert.equal(serialized.includes("also-secret"), false);
+  assert.equal(serialized.includes("/Users/example"), false);
+  assert.equal(serialized.includes("do not expose this"), false);
+});
+
 test("stages provider files with digest metadata and hides storage paths", async () => {
   const provider = new RecordingProvider({ withArtifact: true });
   const gateway = await new Web2ApiGateway({

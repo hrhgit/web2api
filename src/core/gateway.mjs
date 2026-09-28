@@ -11,6 +11,7 @@ import {
 import { stageArtifactFromFile } from "./artifacts.mjs";
 import { FileJobStore } from "./job-store.mjs";
 import { ProviderError } from "../providers/provider.mjs";
+import { safeDiagnosticIdentifier, sanitizeDiagnosticMessage, summarizeError } from "../providers/diagnostics.mjs";
 
 class SerialTaskQueue {
   #waiting = [];
@@ -71,11 +72,59 @@ function statusForError(error) {
   return "failed";
 }
 
-function serializableError(error) {
-  if (error instanceof ProviderError || error instanceof ApiError) {
-    return { code: error.code, message: error.message, details: error.details ?? null };
-  }
-  return { code: "provider_failed", message: "An unexpected provider operation failed.", details: null };
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function elapsedMilliseconds(startedAt, finishedAt) {
+  const start = Date.parse(startedAt || "");
+  const finish = Date.parse(finishedAt || "");
+  return Number.isFinite(start) && Number.isFinite(finish) && finish >= start ? finish - start : null;
+}
+
+function diagnosticForJob(error, job, failedAt) {
+  const details = isRecord(error?.details) ? error.details : {};
+  const providerDiagnostic = isRecord(details.diagnostic) ? details.diagnostic : {};
+  const underlying = isRecord(providerDiagnostic.underlying)
+    ? {
+      name: safeDiagnosticIdentifier(providerDiagnostic.underlying.name) || "Error",
+      code: safeDiagnosticIdentifier(providerDiagnostic.underlying.code),
+      message: typeof providerDiagnostic.underlying.message === "string" && providerDiagnostic.underlying.message
+        ? sanitizeDiagnosticMessage(providerDiagnostic.underlying.message)
+        : summarizeError(error?.cause || error).message,
+    }
+    : summarizeError(error?.cause || error);
+  return {
+    phase: safeDiagnosticIdentifier(providerDiagnostic.phase) || "provider_generation",
+    submission: ["not_sent", "unknown", "confirmed"].includes(job.submission) ? job.submission : "unknown",
+    timing: {
+      startedAt: typeof job.startedAt === "string" ? job.startedAt : null,
+      failedAt,
+      durationMs: elapsedMilliseconds(job.startedAt, failedAt),
+    },
+    underlying,
+  };
+}
+
+function serializableError(error, { job = null, failedAt = null } = {}) {
+  const details = error instanceof ProviderError || error instanceof ApiError
+    ? error.details ?? null
+    : null;
+  const base = error instanceof ProviderError || error instanceof ApiError
+    ? { code: error.code, message: sanitizeDiagnosticMessage(error.message), details }
+    : {
+      code: "provider_failed",
+      message: "The provider operation failed before completion. Inspect the diagnostic details.",
+      details: null,
+    };
+  if (!job) return base;
+  return {
+    ...base,
+    details: {
+      ...(isRecord(details) ? details : {}),
+      diagnostic: diagnosticForJob(error, job, failedAt || new Date().toISOString()),
+    },
+  };
 }
 
 export class Web2ApiGateway {
@@ -360,13 +409,17 @@ export class Web2ApiGateway {
       }));
     } catch (error) {
       const normalizedError = controller.signal.aborted
-        ? new ProviderError("timeout", `Provider ${provider.id} exceeded the ${request.timeoutMs}ms timeout.`, { cause: error })
+        ? new ProviderError("timeout", `Provider ${provider.id} exceeded the ${request.timeoutMs}ms timeout.`, {
+          details: error instanceof ProviderError ? error.details : null,
+          cause: error,
+        })
         : error;
+      const completedAt = new Date().toISOString();
       await this.store.update(jobId, (job) => ({
         ...job,
         status: job.status === "cancelling" ? "cancelled" : statusForError(normalizedError),
-        error: job.status === "cancelling" ? null : serializableError(normalizedError),
-        completedAt: new Date().toISOString(),
+        error: job.status === "cancelling" ? null : serializableError(normalizedError, { job, failedAt: completedAt }),
+        completedAt,
       }));
     } finally {
       clearTimeout(timeout);

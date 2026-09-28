@@ -14,7 +14,7 @@ const account = '<a aria-label="Google Account: Fixture" href="#">Fixture accoun
 const editor = '<div role="textbox" contenteditable="true"></div>';
 const signIn = '<a href="https://accounts.google.com/ServiceLogin">Sign in</a>';
 
-function modelControls(initial = "gemini-flash", { compactSummary = false } = {}) {
+function modelControls(initial = "gemini-flash", { compactSummary = false, legacyTestId = true } = {}) {
   const options = [
     ["gemini-flash", "Gemini Flash"],
     ["gemini-pro", "Gemini Pro"],
@@ -23,7 +23,8 @@ function modelControls(initial = "gemini-flash", { compactSummary = false } = {}
   const pickerLabel = compactSummary ? `Open mode picker, currently ${initialLabel.replace(/^Gemini /u, "")}` : initialLabel;
   const pickerAttributes = compactSummary ? "" : ` data-model-id="${initialId}" data-model-label="${initialLabel}"`;
   const pickerText = compactSummary ? initialLabel.replace(/^Gemini /u, "") : initialLabel;
-  return `<button data-testid="bard-mode-menu-button" aria-haspopup="menu"${pickerAttributes} aria-label="${pickerLabel}" onclick="toggleModelMenu()">${pickerText}</button>
+  const testId = legacyTestId ? ' data-testid="bard-mode-menu-button"' : "";
+  return `<button${testId} aria-haspopup="menu"${pickerAttributes} aria-label="${pickerLabel}" onclick="toggleModelMenu()">${pickerText}</button>
     <div id="model-menu" role="menu" hidden>${options.map(([id, label]) =>
       `<button role="menuitemradio" data-model-id="${id}" data-model-label="${label}" aria-checked="${id === initialId}" onclick="chooseModel(this)">${label}</button>`,
     ).join("")}</div>
@@ -31,7 +32,7 @@ function modelControls(initial = "gemini-flash", { compactSummary = false } = {}
       function toggleModelMenu() { document.querySelector('#model-menu').hidden = !document.querySelector('#model-menu').hidden; }
       function chooseModel(option) {
         for (const entry of document.querySelectorAll('#model-menu [role=menuitemradio]')) entry.setAttribute('aria-checked', String(entry === option));
-        const picker = document.querySelector('[data-testid=bard-mode-menu-button]');
+        const picker = document.querySelector('[data-testid=bard-mode-menu-button]') || document.querySelector('button[aria-label^="Open mode picker"]');
         picker.dataset.modelId = option.dataset.modelId;
         picker.dataset.modelLabel = option.dataset.modelLabel;
         picker.setAttribute('aria-label', option.dataset.modelLabel);
@@ -61,8 +62,8 @@ async function fixtureProvider(t, renderPage) {
   };
 }
 
-function responsePage(responseHtml, notificationHtml = "", { initialModel = "gemini-flash", changeModelOnInput = false, compactModelSummary = false } = {}) {
-  return `<!doctype html><body>${account}${modelControls(initialModel, { compactSummary: compactModelSummary })}${editor}
+function responsePage(responseHtml, notificationHtml = "", { initialModel = "gemini-flash", changeModelOnInput = false, compactModelSummary = false, legacyTestId = true } = {}) {
+  return `<!doctype html><body>${account}${modelControls(initialModel, { compactSummary: compactModelSummary, legacyTestId })}${editor}
     <button aria-label="Send" onclick="send()">Send</button>
     <script>
       function send() {
@@ -181,6 +182,16 @@ test("Gemini recognizes a compact current-model announcement", async (t) => {
   assert.equal(fixture.submittedPrompt, null);
 });
 
+test("Gemini discovers the current Open mode picker without a legacy test id", async (t) => {
+  const fixture = await fixtureProvider(t, () => responsePage("", "", { compactModelSummary: true, legacyTestId: false }));
+  const models = await fixture.provider.listModels({ timeoutMs: 3000 });
+  assert.deepEqual(models, [
+    { id: "gemini-flash", label: "Gemini Flash", selected: true, available: true },
+    { id: "gemini-pro", label: "Gemini Pro", selected: false, available: true },
+  ]);
+  assert.equal(fixture.submittedPrompt, null);
+});
+
 test("Gemini selects a discovered model and records UI confirmation", async (t) => {
   const fixture = await fixtureProvider(t, () => responsePage("Selected result"));
   const prompt = "Use the selected model.";
@@ -200,6 +211,21 @@ test("Gemini rejects an unavailable model before submitting a prompt", async (t)
   await assert.rejects(
     fixture.provider.generate({ model: "not-in-catalog", input: [{ type: "text", text: "never send" }], output: { format: "text" }, timeoutMs: 3000 }),
     (error) => error.code === "model_unavailable",
+  );
+  assert.equal(fixture.submittedPrompt, null);
+});
+
+test("Gemini annotates a failed provider operation with its safe execution phase", async (t) => {
+  const fixture = await fixtureProvider(t, () => responsePage("Should not submit"));
+  await assert.rejects(
+    fixture.provider.generate({ model: "not-in-catalog", input: [{ type: "text", text: "never send" }], output: { format: "text" }, timeoutMs: 3000 }),
+    (error) => {
+      assert.equal(error.code, "model_unavailable");
+      assert.equal(error.details?.diagnostic?.phase, "model_selection");
+      assert.equal(error.details?.diagnostic?.underlying?.name, "ProviderError");
+      assert.equal(error.details?.diagnostic?.underlying?.code, "model_unavailable");
+      return true;
+    },
   );
   assert.equal(fixture.submittedPrompt, null);
 });

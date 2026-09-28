@@ -5,7 +5,7 @@ import { BrowserPagePool, launchBrowser } from "./browser-session.mjs";
 import { browserCapabilities, ProviderError } from "./provider.mjs";
 import { extractResponseText } from "./extract-response.mjs";
 import { attachGeminiFile, attachmentNames, inspectGeminiUploadPage } from "./local-files.mjs";
-import { createUploadDebugLogger, summarizeError } from "./diagnostics.mjs";
+import { createUploadDebugLogger, providerFailureDiagnostic, summarizeError } from "./diagnostics.mjs";
 import {
   assertModelOptionSelected,
   discoverModelOptions,
@@ -29,6 +29,9 @@ const MODEL_PICKER = {
     '[role="button"][data-testid*="model-picker"]',
     '[role="button"][data-test-id*="model-picker"]',
     'button[aria-haspopup="menu"][aria-label*="model" i]',
+    // Gemini's current picker is announced as e.g. "Open mode picker,
+    // currently 3.6 Flash" and does not include the word "model".
+    'button[aria-label^="Open mode picker" i]',
   ],
   optionSelector: [
     '[role="menu"] [role="menuitemradio"]',
@@ -42,6 +45,28 @@ const MODEL_PICKER = {
 
 function normalizeText(value) {
   return String(value).replace(/\s+/gu, " ").trim();
+}
+
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function withFailureDiagnostic(error, phase) {
+  const details = error instanceof ProviderError && isRecord(error.details) ? error.details : {};
+  const existing = isRecord(details.diagnostic) ? details.diagnostic : {};
+  const sourceError = error instanceof ProviderError && error.cause ? error.cause : error;
+  const diagnostic = {
+    ...providerFailureDiagnostic(sourceError, { phase: existing.phase || phase }),
+    ...(isRecord(existing.underlying) ? { underlying: existing.underlying } : {}),
+  };
+  const code = error instanceof ProviderError ? error.code : "provider_failed";
+  const message = error instanceof ProviderError
+    ? error.message
+    : `Gemini failed during ${String(phase).replaceAll("_", " ")}.`;
+  return new ProviderError(code, message, {
+    details: { ...details, diagnostic },
+    cause: error instanceof ProviderError ? error.cause : error,
+  });
 }
 
 function defaultProfileDirectory() {
@@ -240,10 +265,17 @@ export class GeminiWebProvider {
 
   async generate(request, { jobId = null, signal, conversationUrl = null, reportSubmission = async () => {} } = {}) {
     signal?.throwIfAborted();
-    const { page, release } = await this.pool.acquire();
+    let acquired;
+    try {
+      acquired = await this.pool.acquire();
+    } catch (error) {
+      throw withFailureDiagnostic(error, "browser_session_acquire");
+    }
+    const { page, release } = acquired;
     const log = (event, details = {}) => this.uploadLog?.(event, { provider: this.id, jobId, ...details });
     const uploadLog = this.uploadLog ? log : null;
     const closeOnAbort = () => { void page.close().catch(() => {}); };
+    let phase = "page_navigation";
     signal?.addEventListener("abort", closeOnAbort, { once: true });
     try {
       if (signal?.aborted) throw signal.reason || new Error("Job aborted.");
@@ -255,13 +287,18 @@ export class GeminiWebProvider {
         timeoutMs: request.timeoutMs,
       });
       await page.goto(conversationUrl ? conversationAddress(conversationUrl, this.id) : GEMINI_URL, { waitUntil: "domcontentloaded", timeout: Math.min(request.timeoutMs, 60_000) });
+      phase = "page_ready";
       await waitForGeminiReady(page, Math.min(request.timeoutMs, 60_000));
-      if (conversationUrl) await waitForConversationIdle(page, {
-        address: conversationUrl, provider: this.id, state: () => getModelState(page, request.output.format),
-        userSelector: USER_QUERY_SELECTOR, timeoutMs: Math.min(request.timeoutMs, 60_000), signal,
-      });
+      if (conversationUrl) {
+        phase = "conversation_ready";
+        await waitForConversationIdle(page, {
+          address: conversationUrl, provider: this.id, state: () => getModelState(page, request.output.format),
+          userSelector: USER_QUERY_SELECTOR, timeoutMs: Math.min(request.timeoutMs, 60_000), signal,
+        });
+      }
       log("gemini_page_ready", { url: page.url(), title: await page.title().catch(() => null) });
       const format = request.output.format;
+      phase = "baseline_capture";
       const baseline = await getModelState(page, format);
       if (request.conversationId && !conversationUrl && (baseline.count || await page.locator(USER_QUERY_SELECTOR).count())) {
         throw new ProviderError("conversation_unavailable", "A fresh conversation could not be established. No prompt was sent.");
@@ -271,26 +308,31 @@ export class GeminiWebProvider {
         responseCount: baseline.count,
         composerReady: Boolean(await page.locator(PROMPT_SELECTOR).count()),
       });
+      phase = "attachment_upload";
       for (const item of request.input) {
         if (item.type === "local_file") {
           await attachGeminiFile(page, item.path, { log: uploadLog, uploadMethod: this.uploadMethod });
         }
       }
       if (uploadLog) {
+        phase = "attachment_inspection";
         log("gemini_after_upload", {
           ...(await inspectGeminiUploadPage(page, request.input.filter((item) => item.type === "local_file").map((item) => item.path))),
         });
       }
       if (this.attachmentSettleMs > 0 && request.input.some((item) => item.type === "local_file")) {
+        phase = "attachment_settle";
         log("gemini_attachment_settle_started", { milliseconds: this.attachmentSettleMs });
         await page.waitForTimeout(this.attachmentSettleMs);
         log("gemini_attachment_settle_finished", { milliseconds: this.attachmentSettleMs });
       }
       const modelSelection = await this.submissionGate.run(async () => {
         signal?.throwIfAborted();
+        phase = "model_selection";
         const selection = request.model
           ? await selectModelOption(page, request.model, MODEL_PICKER, { timeoutMs: Math.min(request.timeoutMs, 30_000) })
           : null;
+        phase = "prompt_composition";
         const prompt = composePrompt(request);
         const previousMessages = await submittedMessages(page);
         const editor = page.locator(PROMPT_SELECTOR);
@@ -299,12 +341,14 @@ export class GeminiWebProvider {
           throw new ProviderError("composer_mismatch", "Gemini's composer did not retain the submitted prompt.");
         }
         if (selection) {
+          phase = "model_confirmation";
           await assertModelOptionSelected(page, selection.selected, MODEL_PICKER, {
             timeoutMs: Math.min(request.timeoutMs, 10_000),
           });
         }
         const send = page.getByRole("button", { name: /^(send|send message|submit|发送|发送消息)$/iu });
         signal?.throwIfAborted();
+        phase = "submission_preflight";
         log("gemini_before_submit", { url: page.url(), userMessageCount: previousMessages.length });
         if (conversationUrl) {
           assertConversationPage(page, conversationUrl, this.id);
@@ -313,9 +357,11 @@ export class GeminiWebProvider {
             throw new ProviderError("conversation_busy", "Conversation changed before submission. No follow-up was sent.");
           }
         }
+        phase = "submission_send";
         await reportSubmission("unknown");
         await send.click({ timeout: 120_000 });
         log("gemini_send_clicked", { url: page.url() });
+        phase = "submission_confirmation";
         await page.waitForFunction(
           ({ selector, previousCount, expected, attachments }) => {
             const nodes = [...document.querySelectorAll(selector)];
@@ -342,7 +388,9 @@ export class GeminiWebProvider {
         });
         return selection;
       });
+      phase = "response_wait";
       const response = await waitForModelResponse(page, baseline, { timeoutMs: request.timeoutMs, signal, format, log });
+      phase = "response_finalize";
       if (conversationUrl) assertConversationPage(page, conversationUrl, this.id);
       if (request.conversationId) conversationAddress(page.url(), this.id);
       return {
@@ -356,8 +404,14 @@ export class GeminiWebProvider {
         },
       };
     } catch (error) {
-      log("gemini_generation_failed", { url: page.url(), error: summarizeError(error) });
-      throw error;
+      const diagnosed = withFailureDiagnostic(error, phase);
+      log("gemini_generation_failed", {
+        url: page.url(),
+        phase,
+        error: summarizeError(diagnosed),
+        diagnostic: diagnosed.details?.diagnostic || null,
+      });
+      throw diagnosed;
     } finally {
       signal?.removeEventListener("abort", closeOnAbort);
       await release();
