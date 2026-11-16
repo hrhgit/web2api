@@ -1,6 +1,6 @@
 {
   "name": "@ruihuahe/web2api",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "type": "module",
   "description": "A capability-declared local gateway for browser-backed AI web applications.",
   "license": "MIT",
