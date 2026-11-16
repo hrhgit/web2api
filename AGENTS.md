@@ -2,6 +2,8 @@
 
 ## Harness
 
+- 与用户交流和汇报状态时尽量使用常见词汇，少用专业名词。
+
 - Native multi-turn conversations must resume the same provider conversation and serialize turns within each conversation. Never send a follow-up while the preceding generation is active or its completion is uncertain.
 
 - Keep web2api a capability-declared adapter gateway: never claim full model-API compatibility for browser functionality that is unavailable or only emulated, including true system roles, native tool calls, model controls, token accounting, and token streaming.
