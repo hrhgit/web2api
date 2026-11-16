@@ -114,3 +114,94 @@ test("the menu upload path skips native drag when explicitly selected", async (t
 
   assert.deepEqual(events, ["upload-menu-opened", "file-button-clicked", "file-selected"]);
 });
+
+test("attachment confirmation accepts a visible file label outside body text", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "web2api-label-upload-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const file = path.join(root, "chunk-0001.m4a");
+  await writeFile(file, "fixture");
+  const page = {
+    locator: () => ({
+      count: async () => 1,
+      nth: () => ({ isVisible: async () => true, boundingBox: async () => ({ x: 0, y: 0, width: 20, height: 20 }) }),
+    }),
+    context: () => ({ newCDPSession: async () => ({ send: async () => {}, detach: async () => {} }) }),
+    evaluate: async () => ({
+      url: "https://gemini.google.com/app/test", title: "Gemini", expectedNames: ["chunk-0001.m4a", "chunk-0001"],
+      bodyContainsExpectedName: false, dropTargets: [], uploadButtons: [], fileInputs: [],
+      attachments: [{ label: "chunk-0001.m4a", visible: true }], editors: [{ visible: true }], userMessages: 0, modelResponses: 0,
+    }),
+    waitForFunction: async (predicate, names, options) => {
+      const previousDocument = globalThis.document;
+      const attachment = {
+        getClientRects: () => [{}],
+        getAttribute: (name) => name === "aria-label" ? "chunk-0001.m4a" : "",
+        textContent: "",
+        matches: (selector) => selector.includes("uploaded-file"),
+      };
+      globalThis.document = {
+        body: { innerText: "" },
+        querySelectorAll: (selector) => selector === "*" || selector.includes("uploaded-file") ? [attachment] : [],
+      };
+      try {
+        assert.equal(predicate(names), true);
+        assert.equal(options.timeout, 90_000);
+      } finally {
+        globalThis.document = previousDocument;
+      }
+    },
+  };
+  await attachGeminiFile(page, file, { uploadMethod: "native" });
+});
+
+test("attachment confirmation accepts Gemini's hidden-chip composer signal", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "web2api-composer-upload-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const file = path.join(root, "chunk-0001.m4a");
+  await writeFile(file, "fixture");
+  const page = {
+    locator: () => ({
+      count: async () => 1,
+      nth: () => ({ isVisible: async () => true, boundingBox: async () => ({ x: 0, y: 0, width: 20, height: 20 }) }),
+    }),
+    context: () => ({ newCDPSession: async () => ({ send: async () => {}, detach: async () => {} }) }),
+    evaluate: async () => ({
+      url: "https://gemini.google.com/app/test", title: "Gemini", expectedNames: ["chunk-0001.m4a", "chunk-0001"],
+      bodyContainsExpectedName: false, dropTargets: [{ visible: true, width: 660, height: 118 }],
+      uploadButtons: [{ label: "Send message", visible: true }], fileInputs: [], attachments: [],
+      editors: [{ visible: true }], userMessages: 0, modelResponses: 0,
+    }),
+    waitForFunction: async (predicate, names, options) => {
+      const previousDocument = globalThis.document;
+      const composer = {
+        getClientRects: () => [{}],
+        getBoundingClientRect: () => ({ height: 118 }),
+        matches: (selector) => selector === "input-area-v2",
+        getAttribute: () => "",
+        textContent: "",
+      };
+      const send = {
+        getClientRects: () => [{}],
+        disabled: false,
+        matches: (selector) => selector === "button",
+        getAttribute: (name) => name === "aria-label" ? "Send message" : "",
+        textContent: "",
+      };
+      globalThis.document = {
+        body: { innerText: "" },
+        querySelectorAll: (selector) => {
+          if (selector === "*") return [composer, send];
+          if (selector === "input-area-v2") return [composer];
+          return [];
+        },
+      };
+      try {
+        assert.equal(predicate(names), true);
+        assert.equal(options.timeout, 90_000);
+      } finally {
+        globalThis.document = previousDocument;
+      }
+    },
+  };
+  await attachGeminiFile(page, file, { uploadMethod: "native" });
+});

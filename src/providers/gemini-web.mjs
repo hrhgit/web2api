@@ -44,7 +44,10 @@ const MODEL_PICKER = {
 };
 
 function normalizeText(value) {
-  return String(value).replace(/\s+/gu, " ").trim();
+  // Gemini may omit zero-width formatting characters when it renders a sent
+  // prompt. They are invisible to the user and have no effect on submission,
+  // so ignore them when confirming the rendered message.
+  return String(value).replace(/[\u200B-\u200D\uFEFF]/gu, "").replace(/\s+/gu, " ").trim();
 }
 
 function isRecord(value) {
@@ -311,7 +314,14 @@ export class GeminiWebProvider {
       phase = "attachment_upload";
       for (const item of request.input) {
         if (item.type === "local_file") {
-          await attachGeminiFile(page, item.path, { log: uploadLog, uploadMethod: this.uploadMethod });
+          // Leave room for model selection and response extraction inside the
+          // job timeout while allowing a slow browser upload more than the old
+          // fixed 60-second confirmation window.
+          await attachGeminiFile(page, item.path, {
+            log: uploadLog,
+            uploadMethod: this.uploadMethod,
+            attachmentTimeoutMs: Math.min(request.timeoutMs, 90_000),
+          });
         }
       }
       if (uploadLog) {
@@ -369,7 +379,7 @@ export class GeminiWebProvider {
             const node = nodes.at(-1);
             const lines = [...node.querySelectorAll(".query-text-line")];
             const text = (lines.length ? lines.map((line) => line.textContent).join("\n") : node.textContent || "")
-              .replace(/\s+/gu, " ").trim();
+              .replace(/[\u200B-\u200D\uFEFF]/gu, "").replace(/\s+/gu, " ").trim();
             const submittedFiles = [...node.querySelectorAll('[data-test-id="uploaded-file"], user-query-file-preview')]
               .map((file) => `${file.getAttribute("aria-label") || ""} ${file.textContent || ""}`);
             return text === expected && attachments.every((names) => submittedFiles.some((label) => names.some((name) => label.includes(name))));

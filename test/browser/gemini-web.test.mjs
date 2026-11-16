@@ -62,7 +62,7 @@ async function fixtureProvider(t, renderPage) {
   };
 }
 
-function responsePage(responseHtml, notificationHtml = "", { initialModel = "gemini-flash", changeModelOnInput = false, compactModelSummary = false, legacyTestId = true } = {}) {
+function responsePage(responseHtml, notificationHtml = "", { initialModel = "gemini-flash", changeModelOnInput = false, compactModelSummary = false, legacyTestId = true, stripZeroWidthSpace = false } = {}) {
   return `<!doctype html><body>${account}${modelControls(initialModel, { compactSummary: compactModelSummary, legacyTestId })}${editor}
     <button aria-label="Send" onclick="send()">Send</button>
     <script>
@@ -70,7 +70,7 @@ function responsePage(responseHtml, notificationHtml = "", { initialModel = "gem
         const text = document.querySelector('[role="textbox"]').innerText;
         capturePrompt(text);
         const query = document.createElement('user-query');
-        query.textContent = text;
+        query.textContent = ${stripZeroWidthSpace ? 'text.replaceAll("\\u200b", "")' : 'text'};
         document.body.append(query);
         const response = document.createElement('model-response');
         response.innerHTML = ${JSON.stringify(`<message-content>${responseHtml}</message-content>`)};
@@ -116,6 +116,14 @@ test("prompt and response error phrases are ordinary content, with no format ins
   assert.equal(fixture.submittedPrompt, task);
   assert.match(result.text, /Something went wrong is an example phrase/);
   assert.equal(result.outputEnforcement, "dom_extraction");
+});
+
+test("confirms a sent prompt when Gemini omits zero-width spaces from its display", async (t) => {
+  const fixture = await fixtureProvider(t, () => responsePage('<p>Done</p>', '', { stripZeroWidthSpace: true }));
+  const prompt = "SELECT \u200b FROM film";
+  const result = await fixture.provider.generate({ input: [{ type: "text", text: prompt }], output: { format: "text" }, timeoutMs: 10000 });
+  assert.equal(fixture.submittedPrompt, prompt);
+  assert.equal(result.text, "Done");
 });
 
 for (const format of ["markdown", "latex"]) {
