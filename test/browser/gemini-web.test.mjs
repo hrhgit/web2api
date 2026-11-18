@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test, { after, before } from "node:test";
 import { chromium } from "playwright-core";
+import { waitForProfileRelease } from "../../src/providers/browser-session.mjs";
 import { GeminiWebProvider } from "../../src/providers/gemini-web.mjs";
 
 let browser;
@@ -166,6 +167,8 @@ test("readiness checks the composer without submitting a model prompt", async (t
   const fixture = await fixtureProvider(t, () => `<!doctype html><body>${account}${editor}`);
   await fixture.provider.check({ timeoutMs: 3000 });
   assert.equal(fixture.submittedPrompt, null);
+  // The browser closes in the background; the profile is released once it has.
+  await waitForProfileRelease(fixture.provider.settings);
   assert.equal(fixture.context.pages().length, 0);
 });
 
@@ -177,6 +180,7 @@ test("Gemini discovers account-visible model choices without submitting a prompt
     { id: "gemini-pro", label: "Gemini Pro", selected: false, available: true },
   ]);
   assert.equal(fixture.submittedPrompt, null);
+  await waitForProfileRelease(fixture.provider.settings);
   assert.equal(fixture.context.pages().length, 0);
 });
 

@@ -1,7 +1,7 @@
 import os from "node:os";
 import { assertConversationPage, conversationAddress, waitForConversationIdle } from "./conversation.mjs";
 import path from "node:path";
-import { BrowserPagePool, launchBrowser } from "./browser-session.mjs";
+import { BrowserPagePool, closeBrowser, launchBrowser } from "./browser-session.mjs";
 import { browserCapabilities, ProviderError } from "./provider.mjs";
 import { extractResponseText } from "./extract-response.mjs";
 import { attachGeminiFile, attachmentNames, inspectGeminiUploadPage } from "./local-files.mjs";
@@ -241,7 +241,7 @@ export class GeminiWebProvider {
     try {
       await page.goto(GEMINI_URL, { waitUntil: "domcontentloaded", timeout: timeoutMs });
       await waitForGeminiReady(page, timeoutMs);
-    } finally { await context.close(); }
+    } finally { closeBrowser(context, this.settings); }
   }
 
   async login({ timeoutMs = 15 * 60_000 } = {}) {
@@ -262,7 +262,7 @@ export class GeminiWebProvider {
       await waitForGeminiReady(page, timeoutMs);
       return await discoverModelOptions(page, MODEL_PICKER, { timeoutMs });
     } finally {
-      await context.close().catch(() => {});
+      closeBrowser(context, this.settings);
     }
   }
 

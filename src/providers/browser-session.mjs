@@ -1,6 +1,41 @@
 import { mkdir } from "node:fs/promises";
+import path from "node:path";
 import { chromium } from "playwright-core";
 import { ProviderError } from "./provider.mjs";
+
+// Chrome can take many seconds to shut down a persistent profile (about 20 s
+// observed with headless Chrome 157 on macOS). Callers should not wait for that
+// before returning a result, so closing happens in the background and the next
+// launch of the same profile waits for it. One process therefore never opens a
+// profile that is still being closed.
+const pendingCloses = new Map();
+// A close that never finishes must not block later launches forever; after this
+// the next launch proceeds and reports profile_busy if Chrome still holds the profile.
+const CLOSE_WAIT_LIMIT_MS = 60_000;
+
+function profileKey(settings) {
+  return path.resolve(settings.profileDirectory);
+}
+
+/** Starts closing a browser context without waiting; later launches of the same profile wait for it. */
+export function closeBrowser(context, settings) {
+  const key = profileKey(settings);
+  const previous = pendingCloses.get(key) || Promise.resolve();
+  const closing = previous.then(() => new Promise((resolve) => {
+    const timer = setTimeout(resolve, CLOSE_WAIT_LIMIT_MS);
+    timer.unref?.();
+    context.close().catch(() => {}).finally(() => { clearTimeout(timer); resolve(); });
+  }));
+  pendingCloses.set(key, closing);
+  void closing.finally(() => { if (pendingCloses.get(key) === closing) pendingCloses.delete(key); });
+  return closing;
+}
+
+/** Resolves once every background close of this profile has finished. */
+export async function waitForProfileRelease(settings) {
+  const key = profileKey(settings);
+  while (pendingCloses.has(key)) await pendingCloses.get(key);
+}
 
 // One persistent profile owner, separate pages per job. Releasing one job must
 // never close the browser underneath another job (including on cancellation).
@@ -33,7 +68,7 @@ export class BrowserPagePool {
         if (--this.#leases === 0) {
           const context = this.#context;
           this.#context = null;
-          await context.close();
+          closeBrowser(context, this.settings);
         }
       }) };
     });
@@ -60,6 +95,7 @@ export async function minimizeBrowserWindow(context, page, { displayName } = {})
 }
 
 export async function launchBrowser(settings, { headed = false, background = false, displayName } = {}) {
+  await waitForProfileRelease(settings);
   await mkdir(settings.profileDirectory, { recursive: true, mode: 0o700 });
   let context;
   try {

@@ -2,7 +2,7 @@ import os from "node:os";
 import { assertConversationPage, conversationAddress, waitForConversationIdle } from "./conversation.mjs";
 import path from "node:path";
 import { assertProviderSupportsRequest } from "../core/contracts.mjs";
-import { launchBrowser } from "./browser-session.mjs";
+import { closeBrowser, launchBrowser } from "./browser-session.mjs";
 import { extractResponseText } from "./extract-response.mjs";
 import { browserCapabilities, ProviderError } from "./provider.mjs";
 import {
@@ -199,7 +199,7 @@ export class OpenAIWebProvider {
       await page.goto(CHATGPT_URL, { waitUntil: "domcontentloaded", timeout: timeoutMs });
       await waitForReady(page, timeoutMs);
       await ensureChatMode(page, timeoutMs);
-    } finally { await context.close(); }
+    } finally { closeBrowser(context, this.settings); }
   }
 
   async listModels({ timeoutMs = 30_000 } = {}) {
@@ -212,7 +212,7 @@ export class OpenAIWebProvider {
       await ensureChatMode(page, Math.min(timeoutMs, 30_000));
       return await discoverModelOptions(page, MODEL_PICKER, { timeoutMs });
     } finally {
-      await context.close().catch(() => {});
+      closeBrowser(context, this.settings);
     }
   }
 

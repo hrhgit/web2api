@@ -37,3 +37,12 @@ test("npm pack dry-run contains only the public runtime package", async () => {
   assert.equal(files.has("AGENTS.md"), false);
   assert.equal(files.has("package-lock.json"), false);
 });
+
+test("package exports the in-process app entry", async () => {
+  const app = await import("@ruihuahe/web2api/app");
+  assert.equal(typeof app.createWeb2ApiApp, "function");
+  assert.equal(typeof app.createProviders, "function");
+  assert.equal(typeof app.defaultDataDirectory, "function");
+  const client = await import("@ruihuahe/web2api/client");
+  assert.equal(typeof client.Web2ApiClient, "function");
+});

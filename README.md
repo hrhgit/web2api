@@ -77,7 +77,18 @@ const completed = await client.waitForTerminal(submitted.id);
 console.log(completed.output.text);
 ```
 
-Run one service process per data directory. Admission and idempotency are serialized within that process; generation is queued separately per provider. Gemini defaults to three independent pages in one persistent browser, preserving FIFO start admission; jobs can finish out of order. Set `WEB2API_GEMINI_CONCURRENCY=1` for serial execution (allowed range 1–16). Other bundled providers remain serial. The advertised `capabilities.scheduling.maxConcurrency` reports the actual limit. Cancelling one Gemini job closes only its own page; the shared browser closes when its last job releases it. Multi-process scheduling is not implemented.
+An application can also embed the gateway in its own Node.js process instead of running `web2api serve`. `@ruihuahe/web2api/app` exports `createWeb2ApiApp({ dataDirectory, providers })`, `createProviders()`, and `defaultDataDirectory()`. The returned `gateway` takes the same request objects as the HTTP API (`submit`, `getJob`, `cancelJob`, `checkProvider`, `listModels`) and keeps the same capability checks, queueing, and conversation rules; no HTTP server or port is opened. The embedding process owns the data directory and the provider browser profiles, so it must not share them with a running `web2api serve` process. Point each provider at its own profile with the environment variables described under [Browser login](#browser-login), set before `createProviders()` runs, and call `gateway.getProvider(id).login()` for the visible sign-in window.
+
+```js
+import { createWeb2ApiApp } from "@ruihuahe/web2api/app";
+
+const { gateway } = await createWeb2ApiApp({ dataDirectory: "/path/to/my-app/web2api" });
+const job = await gateway.submit({ provider: "gemini-web", input: [{ type: "text", text: "Hello" }] });
+const done = await gateway.waitForTerminal(job.id, { timeoutMs: 300_000, intervalMs: 250 });
+console.log(done.output?.text);
+```
+
+Run one service process per data directory. Admission and idempotency are serialized within that process; generation is queued separately per provider. Gemini defaults to three independent pages in one persistent browser, preserving FIFO start admission; jobs can finish out of order. Set `WEB2API_GEMINI_CONCURRENCY=1` for serial execution (allowed range 1–16). Other bundled providers remain serial. The advertised `capabilities.scheduling.maxConcurrency` reports the actual limit. Cancelling one Gemini job closes only its own page; the shared browser closes when its last job releases it. Chrome can take many seconds to shut down a persistent profile, so the browser closes in the background: results and readiness checks return without waiting for it, and the next launch of the same profile in this process waits until the close finishes. Multi-process scheduling is not implemented.
 
 ```bash
 curl http://127.0.0.1:8787/v1/providers
